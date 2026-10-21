@@ -14,6 +14,73 @@ Box2D's built-in fix is the **chain shape**. It only works for static terrain me
 
 **Topological ghosts** is a new mitigation built on Box2D v3.2's pre-solve callback. For each protected body, it works out every step which edges of the nearby shapes form the real surface, ignores the hidden ones, and rebuilds the contact as if that surface were one smooth chain. It is recomputed at the current poses, so it also works across separate bodies: moving platforms, dynamic crates, pieces of different shapes, curved and sliced terrain.
 
+## Q&A
+
+**Does it touch Box2D's code?**
+No. `shared/topo_ghosts.{h,c}` uses only Box2D v3.2's public API:
+- the pre-solve and pre-continuous callbacks;
+- read-only shape and body getters;
+- `b2World_OverlapAABB`;
+- the public chain-segment colliders (`b2CollideChainSegmentAnd*`).
+
+This branch also carries a few engine additions (the `b2Custom*` ghost-vertex API in `src/shape.c`, `src/contact.c` and `box2d.h`). They are a separate experiment, and the method does not use them.
+
+**Can it be used without merging anything into Box2D?**
+Yes. Copy the two files into a game that uses stock Box2D v3.2, call `TopoGhost_PreStep` before each `b2World_Step`, and install the callbacks (see "Using it in a game" below). Two Box2D rules shape how it works:
+- World queries are not allowed inside pre-solve, so the neighbourhood is snapshotted just before the step. Collision runs at the start of the step, so the poses match.
+- A recycled contact skips pre-solve, so contact recycling is turned off for each protected body.
+
+**Would it benefit from being integrated into Box2D?**
+Yes, in several ways:
+- **Every body, not just designated ones.** Inside the engine it could run in the contact update for every dynamic body. It would then work for crates on crates, debris and ragdolls, not only a player.
+- **Creating contacts, not just editing them.** Pre-solve only sees contacts Box2D's collider already produced. Inside the collider it could also *add* the right contact, which fixes the remaining hollow-chain fall-through and the degenerate end-cap case.
+- **No snapshot and no per-body copies.** The engine can read the broad-phase directly during the collide phase, which does not modify the trees. It could also share one topology per area between all bodies, instead of about 400 KB of state per protected body.
+- **Parallelism.** The engine already runs contact updates on its worker threads. Today the per-step build runs serially in `TopoGhost_PreStep`.
+- **Continuous collision.** The engine could apply the same topology inside time-of-impact, instead of vetoing hits after the fact.
+
+**How complex is the method?**
+Let *K* be the number of shapes near a protected body, *E* the number of their edges (at most 8 per polygon, about 8K), and *A* the number of pairs of nearby shapes that touch each other.
+
+| Stage | Cost |
+|---|---|
+| Neighbourhood query (the broad-phase tree) | O(log N + K) |
+| Finding which nearby shapes touch | O(K²) bounding-box tests |
+| Interior cancellation | O(A × 8 × 8) |
+| Covering and ghost selection | O(K) per edge, so O(E × K) |
+| Per contact | O(edges of the touched shape) chain-segment collisions |
+
+There are fixed caps: 128 neighbours, 8 edges per shape, 6 surviving pieces per edge, 16 support surfaces. Past a cap it counts an overflow and falls back to safe behaviour: it leaves edges uncut and keeps Box2D's own contact.
+
+**Where does it scale worst?**
+- **Fast bodies.** The query reaches |v| × 2 steps beyond the body, so the neighbourhood grows with speed. A box at 40 m/s over 0.5 m tiles was the most expensive case measured.
+- **Dense neighbourhoods.** Many small shapes near the body (fine tile grids, rubble, debris) push K up, and the O(K²) and O(E × K) terms grow with it. Past 128 neighbours the topology is incomplete.
+- **Many protected bodies.** Each one builds its own topology and holds about 400 KB of state, so cost and memory grow linearly. The engine-integrated version would share the work.
+- **Large worlds.** Bounds are world-space floats, so precision drops far from the origin in double-precision builds.
+
+**What is the performance overhead?**
+Measured with `ghost_probe --bench` (single thread, Release), as extra time per world step:
+
+| Scenario | No mitigation | Topological | Extra |
+|---|---|---|---|
+| Box on segment tiles | 4.0 µs | 5.7 µs | +1.7 µs |
+| Shape Parade, 6 bodies, slope tiles | 1.8 µs | 2.9 µs | +1.1 µs |
+| Shape Parade, 6 bodies, dynamic crate floor | 13.5 µs | 14.8 µs | +1.3 µs |
+| Parabola Crates, dynamic slices | 14.6 µs | 19.3 µs | +4.7 µs |
+| Parabola Hills, 20 static slices | 3.9 µs | 7.9 µs | +4.0 µs |
+| Fast landing, 40 m/s over 0.5 m tiles (worst measured) | 2.0 µs | 16.0 µs | +14 µs |
+
+So it costs a few microseconds per protected body per step in normal play, rising to around 15 µs for a fast body over fine tiles. That is small next to a 16 ms frame, but it is per protected body, so protect the bodies that need it (players, vehicles, balls) rather than everything.
+
+**Where would it be useful in a game?**
+- **Tile-map platformers and top-down games.** A character sliding or running across grid tiles, along tiled walls, or between tiles of different materials, without merging the level into chains. It also handles slopes and non-square tiles.
+- **Moving platforms, elevators, conveyor pieces, rotating platforms.** Seams between a moving body and static terrain, which chains cannot express.
+- **Crate and block puzzles.** Pushing or rolling things across rows of loose crates or blocks, which are dynamic and shift slightly.
+- **Destructible or procedural terrain.** Fractured pieces (e.g. Voronoi cuts), chunked or streamed worlds, and runtime-edited levels, where the seams change every frame and rebuilding chains is impractical.
+- **Driving and vehicle games.** Wheels and chassis crossing modular track pieces, ramps and crests.
+- **Ball and marble games.** Pinball, mini-golf and rolling-ball track builders, where a ball rolls over pieces placed by hand or by players. Ghost bumps there are very visible.
+- **Level editors and user-generated content.** Pieces snapped together with tiny misalignments and arbitrary shapes.
+- **Physics-heavy characters.** Tumbling or rotating player shapes (wheels, rolling polygons, compound bodies), where Semrau's box-only filter does not apply.
+
 ## 1. What topological ghosts solves
 
 Measured with `ghost_probe` (deterministic, 60 Hz, 4 substeps). Each row is a sample at its default settings; "ok" means it behaves like the same body on a smooth, seamless surface.
