@@ -33,6 +33,7 @@ extern "C"
 #define GHOST_MITIGATIONS_ALL ( GHOST_MITIGATIONS_SEMRAU | GHOST_MITIGATE( ghostMitigation_semrauRecycling ) )
 #define GHOST_MAX_SWEEP 5
 #define GHOST_MAX_AUX_BODIES 4
+#define GHOST_MAX_SURFACE_POINTS 32
 
 // Pre-solve based mitigations, applied to the player only.
 typedef enum GhostMitigation
@@ -85,7 +86,19 @@ typedef struct GhostMetrics
 	bool fellThrough;	 // sank below the fall threshold
 } GhostMetrics;
 
-typedef struct GhostRun
+typedef struct GhostRun GhostRun;
+
+// Measurement frame at a point of a curved surface, see GhostRun::localFrame
+typedef struct GhostLocalFrame
+{
+	b2Vec2 tangent;		 // local surface direction of travel
+	b2Vec2 normal;		 // local outward surface normal
+	float progress;		 // distance travelled along the path (e.g. arc length)
+	float height;		 // signed distance of the player above the surface along normal
+	float expectedSpeed; // ideal tangential speed here (e.g. from energy conservation), <= 0: launch speed
+} GhostLocalFrame;
+
+struct GhostRun
 {
 	b2WorldId worldId;
 	b2BodyId playerId;
@@ -103,6 +116,18 @@ typedef struct GhostRun
 	float fallDepth;	 // sink beyond this counts as falling through
 	float lastTangentSpeed;
 
+	// Optional curved measurement frame. When set, GhostRun_Update ignores origin/tangent/normal
+	// and measures against the local frame at the player position instead: hop/sink = height -
+	// restHeight, kick = velocity along the local normal, progress = frame progress. Speeds are
+	// normalized by the frame's expected speed (gravity changes the speed on a curved path):
+	// minSpeedRatio = min tangential speed / expected speed, snags = drops of that ratio by more
+	// than 10% in one step, and idealProgress integrates the expected speed over time.
+	GhostLocalFrame ( *localFrame )( const GhostRun* run, b2Vec2 position );
+
+	// Surface polyline (left to right) for GhostPolylineFrame, in world coordinates
+	b2Vec2 surfacePoints[GHOST_MAX_SURFACE_POINTS];
+	int surfacePointCount;
+
 	// Optional scenario driven bodies (kinematic platforms) and the time at the start of the
 	// current step, steps * 1/60, for deterministic motion
 	b2BodyId auxBodyIds[GHOST_MAX_AUX_BODIES];
@@ -115,7 +140,7 @@ typedef struct GhostRun
 	TopoGhostContext topo;
 
 	GhostMetrics metrics;
-} GhostRun;
+};
 
 typedef struct GhostScenario
 {
@@ -172,6 +197,11 @@ void GhostRun_PreStep( GhostRun* run );
 
 // Call after each world step to update the metrics
 void GhostRun_Update( GhostRun* run );
+
+// Local frame of the closest point on run->surfacePoints: tangent/normal of the closest segment
+// (normal is the left perpendicular, +y for a left to right floor), progress = arc length from the
+// first point. expectedSpeed is left at 0 (launch speed).
+GhostLocalFrame GhostPolylineFrame( const GhostRun* run, b2Vec2 position );
 
 #ifdef __cplusplus
 }

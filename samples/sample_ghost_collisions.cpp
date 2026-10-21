@@ -192,3 +192,4 @@ static int sampleGhost26 = RegisterGhostCollision<26>();
 static int sampleGhost27 = RegisterGhostCollision<27>();
 static int sampleGhost28 = RegisterGhostCollision<28>();
 static int sampleGhost29 = RegisterGhostCollision<29>();
+static int sampleGhost30 = RegisterGhostCollision<30>();

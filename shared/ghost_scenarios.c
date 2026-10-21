@@ -1535,6 +1535,147 @@ static void CreateCcdBackFace( GhostRun* run )
 	SetFlatFrame( run, 0.5f, 0.5f, 13.0f, 0.5f );
 }
 
+// Parabola Crates: a rolling circle crosses a band of crates lying on the curved floor
+// y = x^2 / 8. The band between the floor and the floor raised by PARABOLA_THICKNESS (measured
+// vertically) is sliced by slanted cuts of uneven spacing and skew into general convex
+// quadrilaterals: two vertices on the floor curve, two on the top curve, straight edges. Adjacent
+// crates share their cut edge exactly. The floor polyline uses the crate bottom vertices, so every
+// crate rests flush on one floor segment.
+#define PARABOLA_CRATE_COUNT 14
+#define PARABOLA_THICKNESS 0.4f
+#define PARABOLA_FRICTION 1.0f
+
+static float ParabolaFloor( float x )
+{
+	return 0.125f * x * x;
+}
+
+// Measure against the crate top polyline. Expected speed: energy conservation for a rolling disk
+// (kinetic energy 3/4 m v^2) relative to the launch point, which ignores the geometric loss at the
+// polyline corners (compare against the smooth chain variant).
+static GhostLocalFrame ParabolaFrame( const GhostRun* run, b2Vec2 position )
+{
+	GhostLocalFrame frame = GhostPolylineFrame( run, position );
+	float g = -b2World_GetGravity( run->worldId ).y * run->params.gravityScale;
+	float v0 = run->params.speed;
+	float v2 = v0 * v0 + ( 4.0f / 3.0f ) * g * ( run->origin.y - position.y );
+	frame.expectedSpeed = b2MaxFloat( sqrtf( b2MaxFloat( v2, 0.0f ) ), 0.5f );
+	return frame;
+}
+
+static void CreateParabolaCrates( GhostRun* run )
+{
+	// Relative crate widths and cut skews (top x - bottom x), deterministic and uneven
+	static const float widths[PARABOLA_CRATE_COUNT] = { 1.0f, 1.3f, 0.8f, 1.15f, 0.9f, 1.25f, 0.85f,
+														 1.1f, 1.35f, 0.95f, 1.2f, 0.8f, 1.05f, 1.3f };
+	static const float skews[PARABOLA_CRATE_COUNT + 1] = { 0.06f,  -0.08f, 0.1f,  -0.05f, 0.09f, -0.1f, 0.04f, 0.12f,
+														   -0.07f, 0.08f,  -0.09f, 0.05f, -0.06f, 0.1f,  -0.04f };
+	const float x0 = -3.5f;
+	const float span = 7.0f;
+
+	float widthSum = 0.0f;
+	for ( int i = 0; i < PARABOLA_CRATE_COUNT; ++i )
+	{
+		widthSum += widths[i];
+	}
+
+	b2Vec2 bottom[PARABOLA_CRATE_COUNT + 1];
+	b2Vec2 top[PARABOLA_CRATE_COUNT + 1];
+	float xb = x0;
+	for ( int i = 0; i <= PARABOLA_CRATE_COUNT; ++i )
+	{
+		float xt = xb + skews[i];
+		bottom[i] = (b2Vec2){ xb, ParabolaFloor( xb ) };
+		top[i] = (b2Vec2){ xt, ParabolaFloor( xt ) + PARABOLA_THICKNESS };
+		if ( i < PARABOLA_CRATE_COUNT )
+		{
+			xb += widths[i] * span / widthSum;
+		}
+	}
+
+	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
+	AddPolyline( groundId, bottom, PARABOLA_CRATE_COUNT + 1, PARABOLA_FRICTION );
+
+	// Rim walls clear of the crates keep the ball in the bowl after it finishes (sample only, the
+	// probe stops at the path end before reaching them)
+	{
+		b2ShapeDef wallDef = b2DefaultShapeDef();
+		b2Polygon left = b2MakeOffsetBox( 0.1f, 1.0f, (b2Vec2){ x0 - 0.2f, ParabolaFloor( x0 ) + 1.0f }, b2Rot_identity );
+		b2Polygon right = b2MakeOffsetBox( 0.1f, 1.0f, (b2Vec2){ -x0 + 0.2f, ParabolaFloor( x0 ) + 1.0f }, b2Rot_identity );
+		b2CreatePolygonShape( groundId, &wallDef, &left );
+		b2CreatePolygonShape( groundId, &wallDef, &right );
+	}
+
+	int variant = run->params.variant;
+	if ( variant == 2 )
+	{
+		// Reference: the crate top surface as one chain-like polyline, no crates
+		AddPolyline( groundId, top, PARABOLA_CRATE_COUNT + 1, PARABOLA_FRICTION );
+	}
+	else
+	{
+		for ( int i = 0; i < PARABOLA_CRATE_COUNT; ++i )
+		{
+			b2Vec2 quad[4] = { bottom[i], bottom[i + 1], top[i + 1], top[i] };
+			b2Hull hull = b2ComputeHull( quad, 4 );
+			B2_ASSERT( hull.count == 4 );
+
+			b2ShapeDef shapeDef = FloorShapeDef( PARABOLA_FRICTION );
+			if ( variant == 0 )
+			{
+				// Dynamic crate whose body origin is its first bottom vertex
+				b2BodyDef bodyDef = b2DefaultBodyDef();
+				bodyDef.type = b2_dynamicBody;
+				bodyDef.position = ToPos( bottom[i] );
+				bodyDef.gravityScale = run->params.gravityScale;
+				b2BodyId crateId = b2CreateBody( run->worldId, &bodyDef );
+
+				for ( int j = 0; j < 4; ++j )
+				{
+					quad[j] = b2Sub( quad[j], bottom[i] );
+				}
+				hull = b2ComputeHull( quad, 4 );
+				shapeDef.density = 1.0f;
+				b2Polygon polygon = b2MakePolygon( &hull, 0.0f );
+				b2CreatePolygonShape( crateId, &shapeDef, &polygon );
+			}
+			else
+			{
+				b2Polygon polygon = b2MakePolygon( &hull, 0.0f );
+				b2CreatePolygonShape( groundId, &shapeDef, &polygon );
+			}
+		}
+	}
+
+	// Rolling ball launched down the local tangent of the first crate top
+	const float radius = 0.25f;
+	b2Vec2 tangent = b2Normalize( b2Sub( top[1], top[0] ) );
+	b2Vec2 start = b2MulAdd( b2Lerp( top[0], top[1], 0.5f ), radius, b2LeftPerp( tangent ) );
+	PlayerDef def = DefaultPlayerDef( run, start );
+	def.velocity = b2MulSV( run->params.speed, tangent );
+	def.angularVelocity = -run->params.speed / radius;
+	def.lockRotation = false;
+	def.friction = 0.6f;
+	CreatePlayerCircle( run, &def, radius );
+
+	B2_ASSERT( PARABOLA_CRATE_COUNT + 1 <= GHOST_MAX_SURFACE_POINTS );
+	float arcLength = 0.0f;
+	for ( int i = 0; i <= PARABOLA_CRATE_COUNT; ++i )
+	{
+		run->surfacePoints[i] = top[i];
+		if ( 0 < i && i < PARABOLA_CRATE_COUNT )
+		{
+			arcLength += b2Distance( top[i - 1], top[i] );
+		}
+	}
+	run->surfacePointCount = PARABOLA_CRATE_COUNT + 1;
+
+	// Finished at the start of the last crate top, on the far rim (x ~ 3)
+	SetFlatFrame( run, radius, 0.5f, arcLength, radius );
+	run->origin = start;
+	run->localFrame = ParabolaFrame;
+}
+
 // clang-format off
 const GhostScenario g_ghostScenarios[] = {
 	{
@@ -1824,6 +1965,16 @@ const GhostScenario g_ghostScenarios[] = {
 		120, CreateCcdBackFace, NULL,
 		0, 0xf, false,
 	},
+	{
+		"Parabola Crates",
+		"Rolling circle over a band of slanted, unevenly cut quadrilateral crates on the curved floor y = x^2/8 (curved measurement frame)",
+		"unused",
+		{ "dynamic slices", "static slices", "smooth chain" }, 3,
+		GHOST_MITIGATIONS_BASIC, 6.0f, 1.0f, 0.0f,
+		ghostSweep_speed, { 3.0f, 6.0f, 10.0f }, 3,
+		600, CreateParabolaCrates, NULL,
+		0, 0, false,
+	},
 };
 // clang-format on
 
@@ -1869,7 +2020,20 @@ void GhostRun_Create( GhostRun* run, b2WorldId worldId, int scenarioIndex, Ghost
 	g_ghostScenarios[scenarioIndex].create( run );
 
 	b2Vec2 v = b2Body_GetLinearVelocity( run->playerId );
-	run->lastTangentSpeed = b2Dot( v, run->tangent );
+	if ( run->localFrame != NULL )
+	{
+		b2Vec2 p = ToVec2( b2Body_GetPosition( run->playerId ) );
+		GhostLocalFrame frame = run->localFrame( run, p );
+		float expected = frame.expectedSpeed > 0.0f ? frame.expectedSpeed : run->params.speed;
+		run->lastTangentSpeed = expected > 0.0f ? b2Dot( v, frame.tangent ) * run->params.speed / expected : 0.0f;
+
+		// Progress is absolute along the frame path, so the ideal starts where the player does
+		run->metrics.idealProgress = frame.progress;
+	}
+	else
+	{
+		run->lastTangentSpeed = b2Dot( v, run->tangent );
+	}
 }
 
 void GhostRun_PreStep( GhostRun* run )
@@ -1888,16 +2052,68 @@ void GhostRun_PreStep( GhostRun* run )
 	}
 }
 
+GhostLocalFrame GhostPolylineFrame( const GhostRun* run, b2Vec2 position )
+{
+	GhostLocalFrame frame = { { 1.0f, 0.0f }, { 0.0f, 1.0f }, 0.0f, 0.0f, 0.0f };
+	float bestDistance = FLT_MAX;
+	float arcLength = 0.0f;
+	for ( int i = 0; i + 1 < run->surfacePointCount; ++i )
+	{
+		b2Vec2 a = run->surfacePoints[i];
+		b2Vec2 b = run->surfacePoints[i + 1];
+		b2Vec2 e = b2Sub( b, a );
+		float length = b2Length( e );
+		if ( length < FLT_EPSILON )
+		{
+			continue;
+		}
+
+		b2Vec2 t = b2MulSV( 1.0f / length, e );
+		float u = b2ClampFloat( b2Dot( b2Sub( position, a ), t ), 0.0f, length );
+		b2Vec2 q = b2MulAdd( a, u, t );
+		float distance = b2Distance( position, q );
+		if ( distance < bestDistance )
+		{
+			b2Vec2 n = b2LeftPerp( t );
+			bestDistance = distance;
+			frame.tangent = t;
+			frame.normal = n;
+			frame.progress = arcLength + u;
+			frame.height = b2Dot( b2Sub( position, q ), n ) < 0.0f ? -distance : distance;
+		}
+
+		arcLength += length;
+	}
+
+	return frame;
+}
+
 void GhostRun_Update( GhostRun* run )
 {
 	GhostMetrics* m = &run->metrics;
 	b2Vec2 p = b2Sub( ToVec2( b2Body_GetPosition( run->playerId ) ), run->origin );
 	b2Vec2 v = b2Body_GetLinearVelocity( run->playerId );
 
-	float s = b2Dot( p, run->tangent );
-	float h = b2Dot( p, run->normal ) - run->restHeight;
-	float vt = b2Dot( v, run->tangent );
-	float vn = b2Dot( v, run->normal );
+	float s, h, vt, vn;
+	if ( run->localFrame != NULL )
+	{
+		// Curved frame: speeds are scaled to the launch speed by the local expected speed
+		GhostLocalFrame frame = run->localFrame( run, ToVec2( b2Body_GetPosition( run->playerId ) ) );
+		float expected = frame.expectedSpeed > 0.0f ? frame.expectedSpeed : run->params.speed;
+		s = frame.progress;
+		h = frame.height - run->restHeight;
+		vt = expected > 0.0f ? b2Dot( v, frame.tangent ) * run->params.speed / expected : 0.0f;
+		vn = b2Dot( v, frame.normal );
+		m->idealProgress += expected * GHOST_TIME_STEP;
+	}
+	else
+	{
+		s = b2Dot( p, run->tangent );
+		h = b2Dot( p, run->normal ) - run->restHeight;
+		vt = b2Dot( v, run->tangent );
+		vn = b2Dot( v, run->normal );
+		m->idealProgress = run->params.speed * GHOST_TIME_STEP * ( m->steps + 1 );
+	}
 
 	if ( run->params.mitigation == ghostMitigation_topological )
 	{
@@ -1906,7 +2122,6 @@ void GhostRun_Update( GhostRun* run )
 
 	m->steps += 1;
 	m->progress = s;
-	m->idealProgress = run->params.speed * GHOST_TIME_STEP * m->steps;
 
 	if ( s >= run->measureStart && m->finished == false )
 	{
