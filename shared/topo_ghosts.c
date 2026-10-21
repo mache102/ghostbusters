@@ -9,76 +9,22 @@
 #include <float.h>
 #include <math.h>
 #include <stddef.h>
+#include <string.h>
 
-// Everything below works in the frame of the touched shape's body ("frame T"), which is also the
-// frame the chain segment colliders return their manifolds in.
+// The topology is built in a "scene frame". The step scene (built once per step in
+// TopoGhost_PreStep) uses world axes with the origin at the player's pre-step position. The
+// per-contact fallback scene uses the frame of the touched shape's body ("frame T"), which is also
+// the frame the chain segment colliders return their manifolds in. Step scene pieces and ghosts are
+// moved to frame T before collision.
 
-#define TOPO_MAX_OWNERS 32
-#define TOPO_MAX_EDGES 192
-#define TOPO_MAX_INTERVALS 6
-#define TOPO_MAX_SUPPORTS 16
-#define TOPO_MAX_SHAPE_EDGES 8
+// Capacity of the per-contact fallback scene (on the callback's stack)
+#define TOPO_MAX_LOCAL_OWNERS 32
+#define TOPO_MAX_LOCAL_EDGES 192
+#define TOPO_MAX_LOCAL_PIECES ( 2 * TOPO_MAX_LOCAL_EDGES )
 
-typedef struct TopoInterval
-{
-	float t0, t1;
-} TopoInterval;
-
-typedef struct TopoEdge
-{
-	b2Vec2 p1, p2;
-	int owner;
-
-	// Surviving portions of the edge after interior cancellation, as parameters along p1 -> p2
-	TopoInterval intervals[TOPO_MAX_INTERVALS];
-	int intervalCount;
-} TopoEdge;
-
-typedef struct TopoOwner
-{
-	const TopoGhostShape* shape;
-	b2Polygon polygon; // in frame T, valid when isSolid
-	bool isSolid;
-	bool centroidInside; // push out through the outer faces of this solid
-	bool fullyInside;	 // embedded: the neighbor faces become walls against phasing
-} TopoOwner;
-
-// A surface line the player is resting on
-typedef struct TopoSupport
-{
-	b2Vec2 point;
-	b2Vec2 normal;
-} TopoSupport;
-
-typedef struct TopoScene
-{
-	TopoOwner owners[TOPO_MAX_OWNERS];
-	int ownerCount;
-	TopoEdge edges[TOPO_MAX_EDGES];
-	int edgeCount;
-	int touchedEdgeCount; // edges [0, touchedEdgeCount) belong to the touched shape (owner 0)
-	b2Vec2 centroid;	  // player centroid in frame T
-
-	// Player core points and radius in frame T
-	b2Vec2 playerPoints[B2_MAX_POLYGON_VERTICES];
-	int playerPointCount;
-	float playerRadius;
-
-	TopoSupport supports[TOPO_MAX_SUPPORTS];
-	int supportCount;
-	float penetrationTolerance;
-
-	// Capacity limit hit while building
-	bool overflow;
-} TopoScene;
-
-// A surviving piece of an edge, used for ghost candidates and collision
-typedef struct TopoPiece
-{
-	b2Vec2 a, b;
-	int edgeIndex;
-	int slot; // interval index within the edge
-} TopoPiece;
+// Ghost vertices to compute in ComputeTopology
+#define TOPO_GHOSTS_NONE ( -2 )
+#define TOPO_GHOSTS_ALL ( -1 )
 
 TopoGhostConfig TopoGhost_DefaultConfig( void )
 {
@@ -93,7 +39,8 @@ TopoGhostConfig TopoGhost_DefaultConfig( void )
 
 void TopoGhost_Init( TopoGhostContext* context, b2WorldId worldId, b2BodyId playerId )
 {
-	*context = (TopoGhostContext){ 0 };
+	// The context is large, avoid a temporary
+	memset( context, 0, sizeof( *context ) );
 	context->worldId = worldId;
 	context->playerId = playerId;
 	context->config = TopoGhost_DefaultConfig();
@@ -162,32 +109,6 @@ static bool GatherNeighbor( b2ShapeId shapeId, void* userContext )
 	return true;
 }
 
-void TopoGhost_PreStep( TopoGhostContext* context )
-{
-	context->neighborCount = 0;
-	if ( b2Body_IsValid( context->playerId ) == false )
-	{
-		return;
-	}
-
-	// A recycled contact skips pre-solve, which would silently disable the mitigation
-	if ( b2Body_IsContactRecyclingEnabled( context->playerId ) )
-	{
-		b2Body_EnableContactRecycling( context->playerId, false );
-	}
-
-	context->playerTransform = b2Body_GetTransform( context->playerId );
-
-	// Cover where the player can reach during the step
-	b2AABB box = b2Body_ComputeBounds( context->playerId );
-	b2Vec2 v = b2Body_GetLinearVelocity( context->playerId );
-	float reach = context->config.queryMargin + 2.0f * b2Length( v ) * context->config.timeStep;
-	box.lowerBound = b2Sub( box.lowerBound, (b2Vec2){ reach, reach } );
-	box.upperBound = b2Add( box.upperBound, (b2Vec2){ reach, reach } );
-
-	b2World_OverlapAABB( context->worldId, b2Pos_zero, box, b2DefaultQueryFilter(), GatherNeighbor, context );
-}
-
 static const TopoGhostShape* FindSnapshot( const TopoGhostContext* context, b2ShapeId shapeId )
 {
 	for ( int i = 0; i < context->neighborCount; ++i )
@@ -216,6 +137,25 @@ static bool AABBsOverlap( b2AABB a, b2AABB b, float margin )
 		   a.lowerBound.y - margin <= b.upperBound.y && b.lowerBound.y - margin <= a.upperBound.y;
 }
 
+static void InitScene( TopoScene* scene, TopoOwner* owners, int ownerCapacity, TopoEdge* edges, int edgeCapacity,
+					   TopoPiece* pieces, bool* covered, int pieceCapacity, float penetrationTolerance )
+{
+	B2_ASSERT( ownerCapacity <= TOPO_MAX_NEIGHBORS );
+	scene->owners = owners;
+	scene->edges = edges;
+	scene->pieces = pieces;
+	scene->covered = covered;
+	scene->ownerCapacity = ownerCapacity;
+	scene->edgeCapacity = edgeCapacity;
+	scene->pieceCapacity = pieceCapacity;
+	scene->ownerCount = 0;
+	scene->edgeCount = 0;
+	scene->pieceCount = 0;
+	scene->supportCount = 0;
+	scene->penetrationTolerance = penetrationTolerance;
+	scene->overflow = false;
+}
+
 static void AddEdge( TopoScene* scene, b2Vec2 p1, b2Vec2 p2, int owner )
 {
 	if ( b2DistanceSquared( p1, p2 ) < FLT_EPSILON )
@@ -223,7 +163,7 @@ static void AddEdge( TopoScene* scene, b2Vec2 p1, b2Vec2 p2, int owner )
 		return;
 	}
 
-	if ( scene->edgeCount == TOPO_MAX_EDGES )
+	if ( scene->edgeCount == scene->edgeCapacity )
 	{
 		scene->overflow = true;
 		return;
@@ -238,11 +178,11 @@ static void AddEdge( TopoScene* scene, b2Vec2 p1, b2Vec2 p2, int owner )
 	scene->edgeCount += 1;
 }
 
-// A snapshot shape's collidable edges in frame T, outward normal on the right. Fills polygon (in
-// frame T) for solid polygons. Returns the edge count.
-static int ShapeEdges( const TopoGhostShape* shape, b2WorldTransform frameT, b2Vec2* p1s, b2Vec2* p2s, b2Polygon* polygon )
+// A snapshot shape's collidable edges in the scene frame, outward normal on the right. Fills
+// polygon (in the scene frame) for solid polygons. Returns the edge count.
+static int ShapeEdges( const TopoGhostShape* shape, b2WorldTransform frame, b2Vec2* p1s, b2Vec2* p2s, b2Polygon* polygon )
 {
-	b2Transform xf = b2InvMulWorldTransforms( frameT, shape->transform );
+	b2Transform xf = b2InvMulWorldTransforms( frame, shape->transform );
 	switch ( shape->type )
 	{
 		case b2_polygonShape:
@@ -281,14 +221,14 @@ static int ShapeEdges( const TopoGhostShape* shape, b2WorldTransform frameT, b2V
 }
 
 // Every player point is behind every face of the polygon by at least the player radius
-static bool PlayerFullyInside( const TopoScene* scene, const b2Polygon* polygon )
+static bool PlayerFullyInside( const TopoPlayer* player, const b2Polygon* polygon )
 {
 	for ( int i = 0; i < polygon->count; ++i )
 	{
-		for ( int j = 0; j < scene->playerPointCount; ++j )
+		for ( int j = 0; j < player->pointCount; ++j )
 		{
-			float offset = b2Dot( polygon->normals[i], b2Sub( scene->playerPoints[j], polygon->vertices[i] ) );
-			if ( offset > -scene->playerRadius )
+			float offset = b2Dot( polygon->normals[i], b2Sub( player->points[j], polygon->vertices[i] ) );
+			if ( offset > -player->radius )
 			{
 				return false;
 			}
@@ -297,10 +237,10 @@ static bool PlayerFullyInside( const TopoScene* scene, const b2Polygon* polygon 
 	return true;
 }
 
-// Add a shape's collidable edges in frame T
-static bool AddOwner( TopoScene* scene, const TopoGhostShape* shape, b2WorldTransform frameT )
+// Add a shape's collidable edges in the scene frame
+static bool AddOwner( TopoScene* scene, const TopoGhostShape* shape, b2WorldTransform frame )
 {
-	if ( scene->ownerCount == TOPO_MAX_OWNERS )
+	if ( scene->ownerCount == scene->ownerCapacity )
 	{
 		scene->overflow = true;
 		return false;
@@ -308,7 +248,7 @@ static bool AddOwner( TopoScene* scene, const TopoGhostShape* shape, b2WorldTran
 
 	b2Vec2 p1s[TOPO_MAX_SHAPE_EDGES], p2s[TOPO_MAX_SHAPE_EDGES];
 	b2Polygon polygon;
-	int count = ShapeEdges( shape, frameT, p1s, p2s, &polygon );
+	int count = ShapeEdges( shape, frame, p1s, p2s, &polygon );
 
 	int owner = scene->ownerCount;
 	TopoOwner* o = scene->owners + owner;
@@ -318,37 +258,39 @@ static bool AddOwner( TopoScene* scene, const TopoGhostShape* shape, b2WorldTran
 	{
 		o->polygon = polygon;
 		o->isSolid = true;
-		o->centroidInside = b2PointInPolygon( &o->polygon, scene->centroid );
-		o->fullyInside = o->centroidInside && PlayerFullyInside( scene, &o->polygon );
+		o->centroidInside = b2PointInPolygon( &o->polygon, scene->player.centroid );
+		o->fullyInside = o->centroidInside && PlayerFullyInside( &scene->player, &o->polygon );
 	}
 
+	o->firstEdge = scene->edgeCount;
 	for ( int i = 0; i < count; ++i )
 	{
 		AddEdge( scene, p1s[i], p2s[i], owner );
 	}
+	o->edgeCount = scene->edgeCount - o->firstEdge;
 
 	scene->ownerCount += 1;
 	return true;
 }
 
 // How deep the player reaches behind a line (positive when penetrating)
-static float PlayerDepth( const TopoScene* scene, b2Vec2 point, b2Vec2 normal )
+static float PlayerDepth( const TopoPlayer* player, b2Vec2 point, b2Vec2 normal )
 {
 	float depth = -FLT_MAX;
-	for ( int i = 0; i < scene->playerPointCount; ++i )
+	for ( int i = 0; i < player->pointCount; ++i )
 	{
-		depth = b2MaxFloat( depth, -b2Dot( normal, b2Sub( scene->playerPoints[i], point ) ) );
+		depth = b2MaxFloat( depth, -b2Dot( normal, b2Sub( player->points[i], point ) ) );
 	}
-	return depth + scene->playerRadius;
+	return depth + player->radius;
 }
 
 // Record the surfaces of a shape that the player rests on: centroid in front and over the span,
 // touching (within the speculative distance) and sunk less than the penetration tolerance
-static void AddSupports( TopoScene* scene, const TopoGhostShape* shape, b2WorldTransform frameT, const TopoGhostConfig* config )
+static void AddSupports( TopoScene* scene, const TopoGhostShape* shape, b2WorldTransform frame, const TopoGhostConfig* config )
 {
 	b2Vec2 p1s[TOPO_MAX_SHAPE_EDGES], p2s[TOPO_MAX_SHAPE_EDGES];
 	b2Polygon polygon;
-	int count = ShapeEdges( shape, frameT, p1s, p2s, &polygon );
+	int count = ShapeEdges( shape, frame, p1s, p2s, &polygon );
 	for ( int i = 0; i < count && scene->supportCount < TOPO_MAX_SUPPORTS; ++i )
 	{
 		b2Vec2 d = b2Sub( p2s[i], p1s[i] );
@@ -360,14 +302,14 @@ static void AddSupports( TopoScene* scene, const TopoGhostShape* shape, b2WorldT
 
 		b2Vec2 u = b2MulSV( 1.0f / length, d );
 		b2Vec2 n = b2RightPerp( u );
-		b2Vec2 r = b2Sub( scene->centroid, p1s[i] );
+		b2Vec2 r = b2Sub( scene->player.centroid, p1s[i] );
 		float along = b2Dot( u, r );
 		if ( b2Dot( n, r ) <= config->linearTolerance || along < 0.0f || along > length )
 		{
 			continue;
 		}
 
-		float depth = PlayerDepth( scene, p1s[i], n );
+		float depth = PlayerDepth( &scene->player, p1s[i], n );
 		if ( depth < -B2_SPECULATIVE_DISTANCE || depth > config->penetrationTolerance )
 		{
 			continue;
@@ -421,7 +363,53 @@ static bool SubtractInterval( TopoEdge* edge, float t0, float t1 )
 	return true;
 }
 
+static bool AreAdjacent( const TopoScene* scene, int a, int b )
+{
+	return ( ( scene->adjacency[a][b >> 5] >> ( b & 31 ) ) & 1u ) != 0;
+}
+
+// Owners can only share edges, vertices or crossings when their snapshot bounds overlap. Box2D
+// computes the bounds from the same snapshot poses, so the margin only covers rounding.
+static void ComputeAdjacency( TopoScene* scene, float margin )
+{
+	int n = scene->ownerCount;
+	for ( int a = 0; a < n; ++a )
+	{
+		memset( scene->adjacency[a], 0, sizeof( scene->adjacency[a] ) );
+	}
+
+	for ( int a = 0; a < n; ++a )
+	{
+		b2AABB boundsA = scene->owners[a].shape->bounds;
+		for ( int b = a + 1; b < n; ++b )
+		{
+			if ( AABBsOverlap( boundsA, scene->owners[b].shape->bounds, margin ) )
+			{
+				scene->adjacency[a][b >> 5] |= 1u << ( b & 31 );
+				scene->adjacency[b][a >> 5] |= 1u << ( a & 31 );
+			}
+		}
+	}
+}
+
+// The owner itself, then its adjacent owners in order. Pieces of other owners cannot meet the
+// owner's pieces. Returns the count.
+static int CandidateOwners( const TopoScene* scene, int owner, int* list )
+{
+	int count = 0;
+	list[count++] = owner;
+	for ( int b = 0; b < scene->ownerCount; ++b )
+	{
+		if ( AreAdjacent( scene, owner, b ) )
+		{
+			list[count++] = b;
+		}
+	}
+	return count;
+}
+
 // Phase 1: cancel portions of edges that coincide with an antiparallel edge of another owner.
+// Only edges of adjacent owners can coincide.
 static void CancelInteriorEdges( TopoScene* scene, const TopoGhostConfig* config )
 {
 	float linTol = config->linearTolerance;
@@ -431,11 +419,11 @@ static void CancelInteriorEdges( TopoScene* scene, const TopoGhostConfig* config
 		b2Vec2 d = b2Sub( e->p2, e->p1 );
 		float length = b2Length( d );
 		b2Vec2 u = b2MulSV( 1.0f / length, d );
+		const TopoOwner* oe = scene->owners + e->owner;
 
-		for ( int j = 0; j < scene->edgeCount; ++j )
+		for ( int b = 0; b < scene->ownerCount; ++b )
 		{
-			const TopoEdge* f = scene->edges + j;
-			if ( f->owner == e->owner )
+			if ( AreAdjacent( scene, e->owner, b ) == false )
 			{
 				continue;
 			}
@@ -443,80 +431,102 @@ static void CancelInteriorEdges( TopoScene* scene, const TopoGhostConfig* config
 			// Embedded in the neighbor's solid: this face is the wall that keeps the player from
 			// phasing on into this solid, keep it. Otherwise (on the surface, or only partly sunk)
 			// the face is interior. Push-out uses only the surviving outer faces.
-			const TopoOwner* oe = scene->owners + e->owner;
-			const TopoOwner* of = scene->owners + f->owner;
+			const TopoOwner* of = scene->owners + b;
 			if ( of->fullyInside && oe->fullyInside == false )
 			{
 				continue;
 			}
 
-			b2Vec2 fd = b2Sub( f->p2, f->p1 );
-			float fLength = b2Length( fd );
-			b2Vec2 fu = b2MulSV( 1.0f / fLength, fd );
-
-			// Antiparallel
-			if ( b2Dot( u, fu ) > 0.0f || b2AbsFloat( b2Cross( u, fu ) ) > config->angularTolerance )
+			for ( int j = of->firstEdge; j < of->firstEdge + of->edgeCount; ++j )
 			{
-				continue;
-			}
+				const TopoEdge* f = scene->edges + j;
+				b2Vec2 fd = b2Sub( f->p2, f->p1 );
+				float fLength = b2Length( fd );
+				b2Vec2 fu = b2MulSV( 1.0f / fLength, fd );
 
-			// Coincident lines
-			if ( b2AbsFloat( b2Cross( u, b2Sub( f->p1, e->p1 ) ) ) > linTol ||
-				 b2AbsFloat( b2Cross( u, b2Sub( f->p2, e->p1 ) ) ) > linTol )
-			{
-				continue;
-			}
+				// Antiparallel
+				if ( b2Dot( u, fu ) > 0.0f || b2AbsFloat( b2Cross( u, fu ) ) > config->angularTolerance )
+				{
+					continue;
+				}
 
-			float ta = b2Dot( u, b2Sub( f->p1, e->p1 ) ) / length;
-			float tb = b2Dot( u, b2Sub( f->p2, e->p1 ) ) / length;
-			float t0 = b2MinFloat( ta, tb );
-			float t1 = b2MaxFloat( ta, tb );
+				// Coincident lines
+				if ( b2AbsFloat( b2Cross( u, b2Sub( f->p1, e->p1 ) ) ) > linTol ||
+					 b2AbsFloat( b2Cross( u, b2Sub( f->p2, e->p1 ) ) ) > linTol )
+				{
+					continue;
+				}
 
-			// Snap to the ends so slivers under the tolerance disappear
-			float tTol = linTol / length;
-			if ( t0 < tTol )
-			{
-				t0 = -1.0f;
-			}
-			if ( t1 > 1.0f - tTol )
-			{
-				t1 = 2.0f;
-			}
+				float ta = b2Dot( u, b2Sub( f->p1, e->p1 ) ) / length;
+				float tb = b2Dot( u, b2Sub( f->p2, e->p1 ) ) / length;
+				float t0 = b2MinFloat( ta, tb );
+				float t1 = b2MaxFloat( ta, tb );
 
-			if ( t1 > t0 && SubtractInterval( e, t0, t1 ) == false )
-			{
-				scene->overflow = true;
+				// Snap to the ends so slivers under the tolerance disappear
+				float tTol = linTol / length;
+				if ( t0 < tTol )
+				{
+					t0 = -1.0f;
+				}
+				if ( t1 > 1.0f - tTol )
+				{
+					t1 = 2.0f;
+				}
+
+				if ( t1 > t0 && SubtractInterval( e, t0, t1 ) == false )
+				{
+					scene->overflow = true;
+				}
 			}
 		}
 	}
 }
 
-static int CollectPieces( const TopoScene* scene, TopoPiece* pieces, int capacity, float linTol )
+// Surviving pieces, grouped by owner
+static void CollectPieces( TopoScene* scene, float linTol )
 {
 	int count = 0;
-	for ( int i = 0; i < scene->edgeCount; ++i )
+	for ( int o = 0; o < scene->ownerCount; ++o )
 	{
-		const TopoEdge* e = scene->edges + i;
-		b2Vec2 d = b2Sub( e->p2, e->p1 );
-		float length = b2Length( d );
-		for ( int k = 0; k < e->intervalCount && count < capacity; ++k )
+		TopoOwner* owner = scene->owners + o;
+		owner->firstPiece = count;
+		owner->truncated = false;
+		for ( int i = owner->firstEdge; i < owner->firstEdge + owner->edgeCount; ++i )
 		{
-			TopoInterval in = e->intervals[k];
-			float t0 = b2MaxFloat( in.t0, 0.0f );
-			float t1 = b2MinFloat( in.t1, 1.0f );
-			if ( ( t1 - t0 ) * length < linTol )
+			const TopoEdge* e = scene->edges + i;
+			b2Vec2 d = b2Sub( e->p2, e->p1 );
+			float length = b2Length( d );
+			for ( int k = 0; k < e->intervalCount; ++k )
 			{
-				continue;
-			}
+				TopoInterval in = e->intervals[k];
+				float t0 = b2MaxFloat( in.t0, 0.0f );
+				float t1 = b2MinFloat( in.t1, 1.0f );
+				if ( ( t1 - t0 ) * length < linTol )
+				{
+					continue;
+				}
 
-			pieces[count].a = b2MulAdd( e->p1, t0, d );
-			pieces[count].b = b2MulAdd( e->p1, t1, d );
-			pieces[count].edgeIndex = i;
-			pieces[count].slot = k;
-			count += 1;
+				if ( count == scene->pieceCapacity )
+				{
+					owner->truncated = true;
+					scene->overflow = true;
+					continue;
+				}
+
+				TopoPiece* piece = scene->pieces + count;
+				piece->a = b2MulAdd( e->p1, t0, d );
+				piece->b = b2MulAdd( e->p1, t1, d );
+				piece->ghost1 = piece->a;
+				piece->ghost2 = piece->b;
+				piece->edgeIndex = i;
+				piece->slot = k;
+				scene->covered[count] = false;
+				count += 1;
+			}
 		}
+		owner->pieceCount = count - owner->firstPiece;
 	}
-	return count;
+	scene->pieceCount = count;
 }
 
 // Angle in (0, 2pi] turning counter-clockwise from ref to v
@@ -542,13 +552,15 @@ static bool Behind( b2Vec2 p1, b2Vec2 p2, b2Vec2 point, float tolerance )
 	return b2Dot( n, b2Sub( point, p1 ) ) < -tolerance;
 }
 
-// A piece of the touched shape is covered when it meets another surface that the player is
-// standing on (centroid in front of it and over its span) and lies behind that surface. The player
-// cannot reach a covered piece without passing through a solid, so it is cancelled for this
-// player, like an interior face. Beside the surface (e.g. falling past a cliff) the piece is live.
-static bool IsCovered( const TopoScene* scene, const TopoPiece* pieces, int pieceCount, int self, float linTol )
+// A piece is covered when it meets another surface that the player is standing on (centroid in
+// front of it and over its span) and lies behind that surface. The player cannot reach a covered
+// piece without passing through a solid, so it is cancelled for this player, like an interior
+// face. Beside the surface (e.g. falling past a cliff) the piece is live. Candidates are the pieces
+// of the listed owners.
+static bool IsCovered( const TopoScene* scene, const int* ownerList, int ownerListCount, int self, float linTol )
 {
-	const TopoPiece* s = pieces + self;
+	const TopoPiece* s = scene->pieces + self;
+	b2Vec2 centroid = scene->player.centroid;
 	float linTolSqr = linTol * linTol;
 
 	// Behind a support surface (not part of it): reachable only by sinking into the support
@@ -568,48 +580,52 @@ static bool IsCovered( const TopoScene* scene, const TopoPiece* pieces, int piec
 		}
 	}
 
-	for ( int i = 0; i < pieceCount; ++i )
+	for ( int k = 0; k < ownerListCount; ++k )
 	{
-		if ( i == self )
+		const TopoOwner* owner = scene->owners + ownerList[k];
+		for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
 		{
-			continue;
-		}
+			if ( i == self )
+			{
+				continue;
+			}
 
-		const TopoPiece* c = pieces + i;
-		b2Vec2 far;
-		if ( b2DistanceSquared( c->a, s->a ) < linTolSqr || b2DistanceSquared( c->b, s->a ) < linTolSqr )
-		{
-			far = s->b;
-		}
-		else if ( b2DistanceSquared( c->a, s->b ) < linTolSqr || b2DistanceSquared( c->b, s->b ) < linTolSqr )
-		{
-			far = s->a;
-		}
-		else
-		{
-			continue;
-		}
+			const TopoPiece* c = scene->pieces + i;
+			b2Vec2 far;
+			if ( b2DistanceSquared( c->a, s->a ) < linTolSqr || b2DistanceSquared( c->b, s->a ) < linTolSqr )
+			{
+				far = s->b;
+			}
+			else if ( b2DistanceSquared( c->a, s->b ) < linTolSqr || b2DistanceSquared( c->b, s->b ) < linTolSqr )
+			{
+				far = s->a;
+			}
+			else
+			{
+				continue;
+			}
 
-		b2Vec2 d = b2Sub( c->b, c->a );
-		float length = b2Length( d );
-		float t = b2Dot( b2Sub( scene->centroid, c->a ), d ) / length;
-		if ( t < 0.0f || t > length )
-		{
-			continue;
-		}
+			b2Vec2 d = b2Sub( c->b, c->a );
+			float length = b2Length( d );
+			float t = b2Dot( b2Sub( centroid, c->a ), d ) / length;
+			if ( t < 0.0f || t > length )
+			{
+				continue;
+			}
 
-		if ( InFront( c->a, c->b, scene->centroid, linTol ) == false || Behind( c->a, c->b, far, linTol ) == false )
-		{
-			continue;
-		}
+			if ( InFront( c->a, c->b, centroid, linTol ) == false || Behind( c->a, c->b, far, linTol ) == false )
+			{
+				continue;
+			}
 
-		// Only while the player actually rests on c (same depth band as the support rule). At a
-		// convex crest the centroid passes over the downslope while the player still rests on the
-		// flat top; cancelling the top there leaves nothing holding the crest.
-		float depth = PlayerDepth( scene, c->a, b2RightPerp( b2MulSV( 1.0f / length, d ) ) );
-		if ( -B2_SPECULATIVE_DISTANCE <= depth && depth <= scene->penetrationTolerance )
-		{
-			return true;
+			// Only while the player actually rests on c (same depth band as the support rule). At a
+			// convex crest the centroid passes over the downslope while the player still rests on the
+			// flat top; cancelling the top there leaves nothing holding the crest.
+			float depth = PlayerDepth( &scene->player, c->a, b2RightPerp( b2MulSV( 1.0f / length, d ) ) );
+			if ( -B2_SPECULATIVE_DISTANCE <= depth && depth <= scene->penetrationTolerance )
+			{
+				return true;
+			}
 		}
 	}
 
@@ -617,11 +633,12 @@ static bool IsCovered( const TopoScene* scene, const TopoPiece* pieces, int piec
 }
 
 // Phase 2: pick the ghost vertex at `vertex` for piece s. atStart selects ghost1 (vertex is s.a)
-// or ghost2 (vertex is s.b).
-static b2Vec2 FindGhost( const TopoScene* scene, const TopoPiece* pieces, const bool* covered, int pieceCount, int self, bool atStart,
-						 float linTol )
+// or ghost2 (vertex is s.b). Candidates are the pieces of the listed owners, in list order.
+static b2Vec2 FindGhost( const TopoScene* scene, const bool* covered, const int* ownerList, int ownerListCount, int self,
+						 bool atStart, float linTol )
 {
-	const TopoPiece* s = pieces + self;
+	const TopoPiece* s = scene->pieces + self;
+	b2Vec2 centroid = scene->player.centroid;
 	b2Vec2 vertex = atStart ? s->a : s->b;
 	b2Vec2 far = atStart ? s->b : s->a;
 	float linTolSqr = linTol * linTol;
@@ -633,41 +650,45 @@ static b2Vec2 FindGhost( const TopoScene* scene, const TopoPiece* pieces, const 
 	b2Vec2 edge1 = b2Normalize( b2Sub( s->b, s->a ) );
 	float bestCross = FLT_MAX;
 	b2Vec2 covering = vertex;
-	for ( int i = 0; i < pieceCount; ++i )
+	for ( int k = 0; k < ownerListCount; ++k )
 	{
-		// A covered piece cannot shield or continue anything for this player
-		if ( i == self || ( covered != NULL && covered[i] ) )
+		const TopoOwner* owner = scene->owners + ownerList[k];
+		for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
 		{
-			continue;
-		}
+			// A covered piece cannot shield or continue anything for this player
+			if ( i == self || ( covered != NULL && covered[i] ) )
+			{
+				continue;
+			}
 
-		const TopoPiece* c = pieces + i;
-		b2Vec2 other;
-		if ( b2DistanceSquared( c->a, vertex ) < linTolSqr )
-		{
-			other = c->b;
-		}
-		else if ( b2DistanceSquared( c->b, vertex ) < linTolSqr )
-		{
-			other = c->a;
-		}
-		else
-		{
-			continue;
-		}
+			const TopoPiece* c = scene->pieces + i;
+			b2Vec2 other;
+			if ( b2DistanceSquared( c->a, vertex ) < linTolSqr )
+			{
+				other = c->b;
+			}
+			else if ( b2DistanceSquared( c->b, vertex ) < linTolSqr )
+			{
+				other = c->a;
+			}
+			else
+			{
+				continue;
+			}
 
-		if ( InFront( c->a, c->b, scene->centroid, linTol ) == false || Behind( c->a, c->b, far, linTol ) == false )
-		{
-			continue;
-		}
+			if ( InFront( c->a, c->b, centroid, linTol ) == false || Behind( c->a, c->b, far, linTol ) == false )
+			{
+				continue;
+			}
 
-		// Convexity of the corner this ghost would create (same test as the chain collider)
-		float cross = atStart ? b2Cross( b2Normalize( b2Sub( vertex, other ) ), edge1 )
-							  : b2Cross( edge1, b2Normalize( b2Sub( other, vertex ) ) );
-		if ( cross < bestCross )
-		{
-			bestCross = cross;
-			covering = other;
+			// Convexity of the corner this ghost would create (same test as the chain collider)
+			float cross = atStart ? b2Cross( b2Normalize( b2Sub( vertex, other ) ), edge1 )
+								  : b2Cross( edge1, b2Normalize( b2Sub( other, vertex ) ) );
+			if ( cross < bestCross )
+			{
+				bestCross = cross;
+				covering = other;
+			}
 		}
 	}
 
@@ -684,85 +705,93 @@ static b2Vec2 FindGhost( const TopoScene* scene, const TopoPiece* pieces, const 
 	b2Vec2 best = vertex;
 	bool found = false;
 
-	for ( int i = 0; i < pieceCount; ++i )
+	for ( int k = 0; k < ownerListCount; ++k )
 	{
-		// A covered piece cannot shield or continue anything for this player
-		if ( i == self || ( covered != NULL && covered[i] ) )
+		const TopoOwner* owner = scene->owners + ownerList[k];
+		for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
 		{
-			continue;
-		}
-
-		const TopoPiece* c = pieces + i;
-		b2Vec2 candidate;
-		if ( atStart )
-		{
-			if ( b2DistanceSquared( c->b, vertex ) < linTolSqr )
-			{
-				candidate = c->a;
-			}
-			else
+			// A covered piece cannot shield or continue anything for this player
+			if ( i == self || ( covered != NULL && covered[i] ) )
 			{
 				continue;
 			}
-		}
-		else
-		{
-			if ( b2DistanceSquared( c->a, vertex ) < linTolSqr )
+
+			const TopoPiece* c = scene->pieces + i;
+			b2Vec2 candidate;
+			if ( atStart )
 			{
-				candidate = c->b;
+				if ( b2DistanceSquared( c->b, vertex ) < linTolSqr )
+				{
+					candidate = c->a;
+				}
+				else
+				{
+					continue;
+				}
 			}
 			else
 			{
+				if ( b2DistanceSquared( c->a, vertex ) < linTolSqr )
+				{
+					candidate = c->b;
+				}
+				else
+				{
+					continue;
+				}
+			}
+
+			b2Vec2 dir = b2Sub( candidate, vertex );
+			float angle = atStart ? CCWAngle( dir, ref ) : CCWAngle( ref, dir );
+			if ( angle < 1e-4f || angle > 2.0f * B2_PI - 1e-4f )
+			{
+				// Same direction, an overlapping duplicate
 				continue;
 			}
-		}
 
-		b2Vec2 dir = b2Sub( candidate, vertex );
-		float angle = atStart ? CCWAngle( dir, ref ) : CCWAngle( ref, dir );
-		if ( angle < 1e-4f || angle > 2.0f * B2_PI - 1e-4f )
-		{
-			// Same direction, an overlapping duplicate
-			continue;
-		}
-
-		if ( angle < bestAngle )
-		{
-			bestAngle = angle;
-			best = candidate;
-			found = true;
+			if ( angle < bestAngle )
+			{
+				bestAngle = angle;
+				best = candidate;
+				found = true;
+			}
 		}
 	}
 
 	if ( found == false )
 	{
 		// Pieces passing through the vertex (T-junctions, partial overlaps)
-		for ( int i = 0; i < pieceCount; ++i )
+		for ( int k = 0; k < ownerListCount; ++k )
 		{
-			if ( i == self )
+			const TopoOwner* owner = scene->owners + ownerList[k];
+			for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
 			{
-				continue;
-			}
+				if ( i == self )
+				{
+					continue;
+				}
 
-			const TopoPiece* c = pieces + i;
-			b2Vec2 d = b2Sub( c->b, c->a );
-			float length = b2Length( d );
-			b2Vec2 u = b2MulSV( 1.0f / length, d );
-			b2Vec2 r = b2Sub( vertex, c->a );
-			float t = b2Dot( u, r );
-			if ( t <= linTol || t >= length - linTol || b2AbsFloat( b2Cross( u, r ) ) > linTol )
-			{
-				continue;
-			}
+				const TopoPiece* c = scene->pieces + i;
+				b2Vec2 d = b2Sub( c->b, c->a );
+				float length = b2Length( d );
+				b2Vec2 u = b2MulSV( 1.0f / length, d );
+				b2Vec2 r = b2Sub( vertex, c->a );
+				float t = b2Dot( u, r );
+				if ( t <= linTol || t >= length - linTol || b2AbsFloat( b2Cross( u, r ) ) > linTol )
+				{
+					continue;
+				}
 
-			// ghost1 needs the part before the vertex, ghost2 the part after
-			b2Vec2 candidate = atStart ? c->a : c->b;
-			b2Vec2 dir = b2Sub( candidate, vertex );
-			float angle = atStart ? CCWAngle( dir, ref ) : CCWAngle( ref, dir );
-			if ( angle < bestAngle && angle > 1e-4f )
-			{
-				bestAngle = angle;
-				best = candidate;
-				found = true;
+				// ghost1 needs the part before the vertex, ghost2 the part after
+				b2Vec2 candidate = atStart ? c->a : c->b;
+				b2Vec2 dir = b2Sub( candidate, vertex );
+				float angle = atStart ? CCWAngle( dir, ref ) : CCWAngle( ref, dir );
+				if ( angle < bestAngle && angle > 1e-4f )
+				{
+					bestAngle = angle;
+					best = candidate;
+					found = true;
+				}
 			}
 		}
 	}
@@ -777,13 +806,73 @@ static b2Vec2 FindGhost( const TopoScene* scene, const TopoPiece* pieces, const 
 	return best;
 }
 
-// The player shape's points, radius and centroid in frame T. The shape's own centroid (not the
-// body's) is used so compound players work.
-static void SetPlayerGeometry( TopoScene* scene, b2ShapeId playerShapeId, b2Transform xf )
+// Cancellation, pieces, and optionally covered flags and ghost vertices (with covered pieces
+// excluded) for the pieces of one owner or all owners.
+static void ComputeTopology( TopoScene* scene, const TopoGhostConfig* config, bool computeCovered, int ghostOwner )
 {
-	scene->centroid = xf.p;
-	scene->playerPointCount = 0;
-	scene->playerRadius = 0.0f;
+	float linTol = config->linearTolerance;
+	ComputeAdjacency( scene, 2.0f * linTol );
+	CancelInteriorEdges( scene, config );
+	CollectPieces( scene, linTol );
+
+	int ownerList[TOPO_MAX_NEIGHBORS + 1];
+	if ( computeCovered )
+	{
+		for ( int o = 0; o < scene->ownerCount; ++o )
+		{
+			const TopoOwner* owner = scene->owners + o;
+			if ( owner->pieceCount == 0 )
+			{
+				continue;
+			}
+
+			int listCount = CandidateOwners( scene, o, ownerList );
+			for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
+			{
+				scene->covered[i] = IsCovered( scene, ownerList, listCount, i, linTol );
+			}
+		}
+	}
+
+	if ( ghostOwner == TOPO_GHOSTS_NONE )
+	{
+		return;
+	}
+
+	const bool* covered = computeCovered ? scene->covered : NULL;
+	int first = ghostOwner == TOPO_GHOSTS_ALL ? 0 : ghostOwner;
+	int last = ghostOwner == TOPO_GHOSTS_ALL ? scene->ownerCount : ghostOwner + 1;
+	for ( int o = first; o < last; ++o )
+	{
+		const TopoOwner* owner = scene->owners + o;
+		if ( owner->pieceCount == 0 )
+		{
+			continue;
+		}
+
+		int listCount = CandidateOwners( scene, o, ownerList );
+		for ( int i = owner->firstPiece; i < owner->firstPiece + owner->pieceCount; ++i )
+		{
+			// Covered pieces are never collided
+			if ( covered != NULL && covered[i] )
+			{
+				continue;
+			}
+
+			TopoPiece* piece = scene->pieces + i;
+			piece->ghost1 = FindGhost( scene, covered, ownerList, listCount, i, true, linTol );
+			piece->ghost2 = FindGhost( scene, covered, ownerList, listCount, i, false, linTol );
+		}
+	}
+}
+
+// The player shape's points, radius and centroid in a scene frame. The shape's own centroid (not
+// the body's) is used so compound players work.
+static void SetPlayerGeometry( TopoPlayer* player, b2ShapeId playerShapeId, b2Transform xf )
+{
+	player->centroid = xf.p;
+	player->pointCount = 0;
+	player->radius = 0.0f;
 	switch ( b2Shape_GetType( playerShapeId ) )
 	{
 		case b2_polygonShape:
@@ -791,32 +880,32 @@ static void SetPlayerGeometry( TopoScene* scene, b2ShapeId playerShapeId, b2Tran
 			b2Polygon polygon = b2Shape_GetPolygon( playerShapeId );
 			for ( int i = 0; i < polygon.count; ++i )
 			{
-				scene->playerPoints[i] = b2TransformPoint( xf, polygon.vertices[i] );
+				player->points[i] = b2TransformPoint( xf, polygon.vertices[i] );
 			}
-			scene->playerPointCount = polygon.count;
-			scene->playerRadius = polygon.radius;
-			scene->centroid = b2TransformPoint( xf, polygon.centroid );
+			player->pointCount = polygon.count;
+			player->radius = polygon.radius;
+			player->centroid = b2TransformPoint( xf, polygon.centroid );
 		}
 		break;
 
 		case b2_circleShape:
 		{
 			b2Circle circle = b2Shape_GetCircle( playerShapeId );
-			scene->playerPoints[0] = b2TransformPoint( xf, circle.center );
-			scene->playerPointCount = 1;
-			scene->playerRadius = circle.radius;
-			scene->centroid = scene->playerPoints[0];
+			player->points[0] = b2TransformPoint( xf, circle.center );
+			player->pointCount = 1;
+			player->radius = circle.radius;
+			player->centroid = player->points[0];
 		}
 		break;
 
 		case b2_capsuleShape:
 		{
 			b2Capsule capsule = b2Shape_GetCapsule( playerShapeId );
-			scene->playerPoints[0] = b2TransformPoint( xf, capsule.center1 );
-			scene->playerPoints[1] = b2TransformPoint( xf, capsule.center2 );
-			scene->playerPointCount = 2;
-			scene->playerRadius = capsule.radius;
-			scene->centroid = b2Lerp( scene->playerPoints[0], scene->playerPoints[1], 0.5f );
+			player->points[0] = b2TransformPoint( xf, capsule.center1 );
+			player->points[1] = b2TransformPoint( xf, capsule.center2 );
+			player->pointCount = 2;
+			player->radius = capsule.radius;
+			player->centroid = b2Lerp( player->points[0], player->points[1], 0.5f );
 		}
 		break;
 
@@ -825,20 +914,128 @@ static void SetPlayerGeometry( TopoScene* scene, b2ShapeId playerShapeId, b2Tran
 	}
 }
 
-// Build the local topology around the touched shape from the pre-step snapshot
-static void BuildScene( TopoScene* scene, const TopoGhostContext* context, const TopoGhostShape* touched, b2ShapeId playerShapeId )
+static bool IsSupportedPlayerType( b2ShapeType type )
+{
+	return type == b2_polygonShape || type == b2_circleShape || type == b2_capsuleShape;
+}
+
+static bool AcceptNeighbor( const TopoGhostContext* context, b2ShapeId playerShapeId, b2Filter playerFilter,
+							const TopoGhostShape* neighbor )
+{
+	if ( ShouldCollide( playerFilter, neighbor->filter ) == false )
+	{
+		return false;
+	}
+
+	return context->filterFcn == NULL || context->filterFcn( playerShapeId, neighbor->shapeId, context->filterContext );
+}
+
+// The topology of the whole neighborhood for one player shape, built once per step
+static void BuildStepScene( TopoGhostContext* context, TopoStepScene* step, b2ShapeId playerShapeId )
+{
+	TopoScene* scene = &step->scene;
+	InitScene( scene, step->owners, TOPO_MAX_NEIGHBORS, step->edges, TOPO_MAX_STEP_EDGES, step->pieces, step->covered,
+			   TOPO_MAX_STEP_PIECES, context->config.penetrationTolerance );
+
+	// World axes, origin at the player: float precision stays local to the player
+	step->playerShapeId = playerShapeId;
+	step->frame = (b2WorldTransform){ context->playerTransform.p, b2Rot_identity };
+	SetPlayerGeometry( &scene->player, playerShapeId, b2InvMulWorldTransforms( step->frame, context->playerTransform ) );
+
+	b2Filter playerFilter = b2Shape_GetFilter( playerShapeId );
+	for ( int i = 0; i < context->neighborCount; ++i )
+	{
+		const TopoGhostShape* neighbor = context->neighbors + i;
+		if ( AcceptNeighbor( context, playerShapeId, playerFilter, neighbor ) == false )
+		{
+			continue;
+		}
+
+		// Any nearby surface can support the player
+		AddSupports( scene, neighbor, step->frame, &context->config );
+		AddOwner( scene, neighbor, step->frame );
+	}
+
+	ComputeTopology( scene, &context->config, true, TOPO_GHOSTS_ALL );
+	if ( scene->overflow )
+	{
+		context->stats.overflow += 1;
+	}
+}
+
+void TopoGhost_PreStep( TopoGhostContext* context )
+{
+	context->neighborCount = 0;
+	context->stepSceneCount = 0;
+	if ( b2Body_IsValid( context->playerId ) == false )
+	{
+		return;
+	}
+
+	// A recycled contact skips pre-solve, which would silently disable the mitigation
+	if ( b2Body_IsContactRecyclingEnabled( context->playerId ) )
+	{
+		b2Body_EnableContactRecycling( context->playerId, false );
+	}
+
+	context->playerTransform = b2Body_GetTransform( context->playerId );
+
+	// Cover where the player can reach during the step
+	b2AABB box = b2Body_ComputeBounds( context->playerId );
+	b2Vec2 v = b2Body_GetLinearVelocity( context->playerId );
+	float reach = context->config.queryMargin + 2.0f * b2Length( v ) * context->config.timeStep;
+	box.lowerBound = b2Sub( box.lowerBound, (b2Vec2){ reach, reach } );
+	box.upperBound = b2Add( box.upperBound, (b2Vec2){ reach, reach } );
+
+	b2World_OverlapAABB( context->worldId, b2Pos_zero, box, b2DefaultQueryFilter(), GatherNeighbor, context );
+
+	// All callbacks of the step see these poses, so the topology is built once here
+	b2ShapeId shapeIds[4 * TOPO_MAX_PLAYER_SHAPES];
+	int shapeCount = b2Body_GetShapes( context->playerId, shapeIds, 4 * TOPO_MAX_PLAYER_SHAPES );
+	for ( int i = 0; i < shapeCount && context->stepSceneCount < TOPO_MAX_PLAYER_SHAPES; ++i )
+	{
+		if ( b2Shape_IsSensor( shapeIds[i] ) || IsSupportedPlayerType( b2Shape_GetType( shapeIds[i] ) ) == false )
+		{
+			continue;
+		}
+
+		BuildStepScene( context, context->stepScenes + context->stepSceneCount, shapeIds[i] );
+		context->stepSceneCount += 1;
+	}
+}
+
+static const TopoStepScene* FindStepScene( const TopoGhostContext* context, b2ShapeId playerShapeId )
+{
+	for ( int i = 0; i < context->stepSceneCount; ++i )
+	{
+		if ( B2_ID_EQUALS( context->stepScenes[i].playerShapeId, playerShapeId ) )
+		{
+			return context->stepScenes + i;
+		}
+	}
+	return NULL;
+}
+
+static int FindOwner( const TopoScene* scene, b2ShapeId shapeId )
+{
+	for ( int i = 0; i < scene->ownerCount; ++i )
+	{
+		if ( B2_ID_EQUALS( scene->owners[i].shape->shapeId, shapeId ) )
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Per-contact fallback: the local topology around the touched shape, in frame T
+static void BuildLocalScene( TopoScene* scene, const TopoGhostContext* context, const TopoGhostShape* touched,
+							 b2ShapeId playerShapeId )
 {
 	b2WorldTransform frameT = touched->transform;
-	scene->ownerCount = 0;
-	scene->edgeCount = 0;
-	scene->supportCount = 0;
-	scene->overflow = false;
-	scene->penetrationTolerance = context->config.penetrationTolerance;
-
-	SetPlayerGeometry( scene, playerShapeId, b2InvMulWorldTransforms( frameT, context->playerTransform ) );
+	SetPlayerGeometry( &scene->player, playerShapeId, b2InvMulWorldTransforms( frameT, context->playerTransform ) );
 
 	AddOwner( scene, touched, frameT );
-	scene->touchedEdgeCount = scene->edgeCount;
 
 	b2Filter playerFilter = b2Shape_GetFilter( playerShapeId );
 	float margin = 2.0f * context->config.linearTolerance;
@@ -852,12 +1049,7 @@ static void BuildScene( TopoScene* scene, const TopoGhostContext* context, const
 			continue;
 		}
 
-		if ( ShouldCollide( playerFilter, neighbor->filter ) == false )
-		{
-			continue;
-		}
-
-		if ( context->filterFcn != NULL && context->filterFcn( playerShapeId, neighbor->shapeId, context->filterContext ) == false )
+		if ( AcceptNeighbor( context, playerShapeId, playerFilter, neighbor ) == false )
 		{
 			continue;
 		}
@@ -898,21 +1090,21 @@ static b2LocalManifold CollidePiece( const b2ChainSegment* cs, b2ShapeId playerS
 	}
 }
 
-// Minimum translation out of the touched solid along one of its surviving (outer) faces.
+// Minimum translation out of the touched solid along one of its surviving (outer) faces. Pieces
+// are moved from the scene frame to frame T by xfTS, the player is in frame T.
 // Returns the piece index, or -1 if there is none.
-static int PushOut( const TopoScene* scene, const TopoPiece* pieces, int pieceCount, b2LocalManifold* manifold, float linTol )
+static int PushOut( const TopoPlayer* player, const TopoScene* scene, int owner, b2Transform xfTS, b2LocalManifold* manifold,
+					float linTol )
 {
+	const TopoOwner* o = scene->owners + owner;
 	int bestPiece = -1;
 	float bestDepth = FLT_MAX;
-	for ( int i = 0; i < pieceCount; ++i )
+	for ( int i = o->firstPiece; i < o->firstPiece + o->pieceCount; ++i )
 	{
-		if ( pieces[i].edgeIndex >= scene->touchedEdgeCount )
-		{
-			continue;
-		}
-
-		b2Vec2 n = b2RightPerp( b2Normalize( b2Sub( pieces[i].b, pieces[i].a ) ) );
-		float depth = PlayerDepth( scene, pieces[i].a, n );
+		b2Vec2 a = b2TransformPoint( xfTS, scene->pieces[i].a );
+		b2Vec2 b = b2TransformPoint( xfTS, scene->pieces[i].b );
+		b2Vec2 n = b2RightPerp( b2Normalize( b2Sub( b, a ) ) );
+		float depth = PlayerDepth( player, a, n );
 		if ( depth < bestDepth )
 		{
 			bestDepth = depth;
@@ -926,21 +1118,21 @@ static int PushOut( const TopoScene* scene, const TopoPiece* pieces, int pieceCo
 	}
 
 	// Up to two deepest player points along the chosen face
-	b2Vec2 a = pieces[bestPiece].a;
-	b2Vec2 n = b2RightPerp( b2Normalize( b2Sub( pieces[bestPiece].b, a ) ) );
+	b2Vec2 a = b2TransformPoint( xfTS, scene->pieces[bestPiece].a );
+	b2Vec2 n = b2RightPerp( b2Normalize( b2Sub( b2TransformPoint( xfTS, scene->pieces[bestPiece].b ), a ) ) );
 	*manifold = (b2LocalManifold){ 0 };
 	manifold->normal = n;
-	for ( int i = 0; i < scene->playerPointCount && manifold->pointCount < 2; ++i )
+	for ( int i = 0; i < player->pointCount && manifold->pointCount < 2; ++i )
 	{
-		b2Vec2 v = scene->playerPoints[i];
-		float depth = -b2Dot( n, b2Sub( v, a ) ) + scene->playerRadius;
+		b2Vec2 v = player->points[i];
+		float depth = -b2Dot( n, b2Sub( v, a ) ) + player->radius;
 		if ( depth < bestDepth - linTol )
 		{
 			continue;
 		}
 
 		b2LocalManifoldPoint* mp = manifold->points + manifold->pointCount;
-		mp->point = b2MulSub( v, scene->playerRadius, n );
+		mp->point = b2MulSub( v, player->radius, n );
 		mp->separation = -depth;
 		mp->id = (uint16_t)( 0x4000 | i );
 		manifold->pointCount += 1;
@@ -959,66 +1151,33 @@ static float MinSeparation( const b2LocalManifold* m )
 	return s;
 }
 
-void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* userContext )
+// Rebuild the manifold of the player against a touched owner of a scene. frameT is the touched
+// shape's (pre-step) body transform, xfTS maps the scene frame to frame T. Reads the scene only.
+static void ReplaceManifold( TopoGhostContext* context, const TopoScene* scene, int owner, b2Transform xfTS,
+							 b2WorldTransform frameT, b2ShapeId playerShapeId, bool playerIsA, b2Manifold* manifold )
 {
-	TopoGhostContext* context = userContext;
-
-	bool playerIsA = B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), context->playerId );
-	bool playerIsB = B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), context->playerId );
-	if ( playerIsA == playerIsB )
+	const TopoOwner* o = scene->owners + owner;
+	if ( o->truncated )
 	{
-		return;
-	}
-
-	b2ShapeId playerShapeId = playerIsA ? shapeIdA : shapeIdB;
-	b2ShapeId touchedId = playerIsA ? shapeIdB : shapeIdA;
-	b2ShapeType playerType = b2Shape_GetType( playerShapeId );
-	if ( playerType != b2_polygonShape && playerType != b2_circleShape && playerType != b2_capsuleShape )
-	{
+		// Some real faces of the touched shape are missing, keep Box2D's manifold
 		context->stats.unchanged += 1;
 		return;
 	}
 
-	// Pre-solve sees the pre-step poses, so the snapshot matches. A shape that entered range
-	// without being snapshotted can be read live here (collide does not move bodies).
-	TopoGhostShape live;
-	const TopoGhostShape* touched = FindSnapshot( context, touchedId );
-	if ( touched == NULL )
-	{
-		if ( SnapshotShape( &live, touchedId ) == false )
-		{
-			context->stats.unchanged += 1;
-			return;
-		}
-		touched = &live;
-	}
-
-	b2WorldTransform frameT = touched->transform;
+	float linTol = context->config.linearTolerance;
 	b2WorldTransform framePlayer = context->playerTransform;
-
-	TopoScene scene;
-	BuildScene( &scene, context, touched, playerShapeId );
-	if ( scene.overflow )
-	{
-		context->stats.overflow += 1;
-	}
-
-	const TopoGhostConfig* config = &context->config;
-	CancelInteriorEdges( &scene, config );
-
-	TopoPiece pieces[TOPO_MAX_EDGES * 2];
-	int pieceCount = CollectPieces( &scene, pieces, TOPO_MAX_EDGES * 2, config->linearTolerance );
-
 	b2Transform xf = b2InvMulWorldTransforms( frameT, framePlayer );
 	b2LocalManifold best = { 0 };
 	int bestPiece = -1;
 	float bestSeparation = FLT_MAX;
 	bool pushedOut = false;
 
-	if ( scene.owners[0].centroidInside )
+	if ( o->centroidInside )
 	{
 		// Inside the touched solid: push out through its outer faces only
-		bestPiece = PushOut( &scene, pieces, pieceCount, &best, config->linearTolerance );
+		TopoPlayer playerT;
+		SetPlayerGeometry( &playerT, playerShapeId, xf );
+		bestPiece = PushOut( &playerT, scene, owner, xfTS, &best, linTol );
 		if ( bestPiece < 0 )
 		{
 			// Fully enclosed, keep Box2D's manifold
@@ -1030,24 +1189,19 @@ void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* mani
 		pushedOut = true;
 	}
 
-	bool covered[TOPO_MAX_EDGES * 2];
-	for ( int i = 0; i < pieceCount; ++i )
+	for ( int i = o->firstPiece; i < o->firstPiece + o->pieceCount && pushedOut == false; ++i )
 	{
-		covered[i] = IsCovered( &scene, pieces, pieceCount, i, config->linearTolerance );
-	}
-
-	for ( int i = 0; i < pieceCount && pushedOut == false; ++i )
-	{
-		if ( pieces[i].edgeIndex >= scene.touchedEdgeCount || covered[i] )
+		if ( scene->covered[i] )
 		{
 			continue;
 		}
 
+		const TopoPiece* piece = scene->pieces + i;
 		b2ChainSegment cs;
-		cs.segment.point1 = pieces[i].a;
-		cs.segment.point2 = pieces[i].b;
-		cs.ghost1 = FindGhost( &scene, pieces, covered, pieceCount, i, true, config->linearTolerance );
-		cs.ghost2 = FindGhost( &scene, pieces, covered, pieceCount, i, false, config->linearTolerance );
+		cs.segment.point1 = b2TransformPoint( xfTS, piece->a );
+		cs.segment.point2 = b2TransformPoint( xfTS, piece->b );
+		cs.ghost1 = b2TransformPoint( xfTS, piece->ghost1 );
+		cs.ghost2 = b2TransformPoint( xfTS, piece->ghost2 );
 		cs.chainId = B2_NULL_INDEX;
 
 		b2LocalManifold local = CollidePiece( &cs, playerShapeId, xf );
@@ -1078,6 +1232,13 @@ void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* mani
 	b2Vec2 originDelta = b2SubPos( frameT.p, framePlayer.p );
 	manifold->normal = playerIsA ? b2Neg( normalT ) : normalT;
 	manifold->pointCount = best.pointCount;
+
+	// Separate id space per piece so warm starting does not match unrelated features. Keyed by the
+	// touched shape's edge and its interval, which are stable step to step.
+	const TopoPiece* bp = scene->pieces + bestPiece;
+	int edgeKey = ( ( ( bp->edgeIndex - o->firstEdge ) & 0xf ) << 3 ) | ( bp->slot & 0x7 );
+	edgeKey |= pushedOut ? 0x40 : 0;
+
 	for ( int i = 0; i < best.pointCount; ++i )
 	{
 		b2ManifoldPoint* mp = manifold->points + i;
@@ -1086,11 +1247,6 @@ void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* mani
 		mp->anchorA = playerIsA ? fromPlayer : fromT;
 		mp->anchorB = playerIsA ? fromT : fromPlayer;
 		mp->separation = best.points[i].separation;
-
-		// Separate id space per piece so warm starting does not match unrelated features
-		// Keyed by the touched edge and its interval, which are stable step to step
-		int edgeKey = ( ( pieces[bestPiece].edgeIndex & 0xf ) << 3 ) | ( pieces[bestPiece].slot & 0x7 );
-		edgeKey |= pushedOut ? 0x40 : 0;
 		mp->id = (uint16_t)( 0x8000 | ( edgeKey << 8 ) | ( best.points[i].id & 0xff ) );
 		mp->normalImpulse = 0.0f;
 		mp->tangentImpulse = 0.0f;
@@ -1102,7 +1258,7 @@ void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* mani
 	context->stats.replaced += 1;
 }
 
-bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* userContext )
+void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* userContext )
 {
 	TopoGhostContext* context = userContext;
 
@@ -1110,49 +1266,76 @@ bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point
 	bool playerIsB = B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), context->playerId );
 	if ( playerIsA == playerIsB )
 	{
-		return true;
+		return;
 	}
 
 	b2ShapeId playerShapeId = playerIsA ? shapeIdA : shapeIdB;
 	b2ShapeId touchedId = playerIsA ? shapeIdB : shapeIdA;
-	b2ShapeType playerType = b2Shape_GetType( playerShapeId );
-	if ( playerType != b2_polygonShape && playerType != b2_circleShape && playerType != b2_capsuleShape )
+	if ( IsSupportedPlayerType( b2Shape_GetType( playerShapeId ) ) == false )
 	{
-		return true;
+		context->stats.unchanged += 1;
+		return;
 	}
 
-	// Continuous collision runs after the solve while other threads write body poses, so only the
-	// pre-step snapshot is used, and the topology is judged at the pre-step pose (the pose the
-	// player swept from), not at the unclamped end pose
+	// Pre-solve sees the pre-step poses, so the step topology applies as is
+	const TopoStepScene* step = FindStepScene( context, playerShapeId );
+	int owner = step != NULL ? FindOwner( &step->scene, touchedId ) : -1;
+	if ( owner >= 0 )
+	{
+		b2WorldTransform frameT = step->scene.owners[owner].shape->transform;
+		b2Transform xfTS = b2InvMulWorldTransforms( frameT, step->frame );
+		ReplaceManifold( context, &step->scene, owner, xfTS, frameT, playerShapeId, playerIsA, manifold );
+		return;
+	}
+
+	// Fallback: build the local topology for this contact. A shape that entered range without being
+	// snapshotted can be read live here (collide does not move bodies).
+	TopoGhostShape live;
 	const TopoGhostShape* touched = FindSnapshot( context, touchedId );
 	if ( touched == NULL )
 	{
-		return true;
+		if ( SnapshotShape( &live, touchedId ) == false )
+		{
+			context->stats.unchanged += 1;
+			return;
+		}
+		touched = &live;
 	}
 
-	b2WorldTransform frameT = touched->transform;
+	TopoOwner owners[TOPO_MAX_LOCAL_OWNERS];
+	TopoEdge edges[TOPO_MAX_LOCAL_EDGES];
+	TopoPiece pieces[TOPO_MAX_LOCAL_PIECES];
+	bool covered[TOPO_MAX_LOCAL_PIECES];
 	TopoScene scene;
-	BuildScene( &scene, context, touched, playerShapeId );
-	if ( scene.overflow || scene.owners[0].centroidInside )
+	InitScene( &scene, owners, TOPO_MAX_LOCAL_OWNERS, edges, TOPO_MAX_LOCAL_EDGES, pieces, covered, TOPO_MAX_LOCAL_PIECES,
+			   context->config.penetrationTolerance );
+	BuildLocalScene( &scene, context, touched, playerShapeId );
+	ComputeTopology( &scene, &context->config, true, 0 );
+	if ( scene.overflow )
 	{
-		return true;
+		context->stats.overflow += 1;
 	}
 
-	CancelInteriorEdges( &scene, &context->config );
+	// The scene is in frame T already
+	ReplaceManifold( context, &scene, 0, b2Transform_identity, touched->transform, playerShapeId, playerIsA, manifold );
+}
 
-	TopoPiece pieces[TOPO_MAX_EDGES * 2];
+// Judge a time of impact on a touched owner of a scene, at the pre-step pose. Reads the scene only.
+static bool JudgeContinuous( TopoGhostContext* context, const TopoScene* scene, int owner, b2WorldTransform frame, b2Pos point,
+							 b2Vec2 normal, bool playerIsA )
+{
+	const TopoOwner* o = scene->owners + owner;
 	float linTol = context->config.linearTolerance;
-	int pieceCount = CollectPieces( &scene, pieces, TOPO_MAX_EDGES * 2, linTol );
 
 	// Veto the time of impact only if it lands on the touched shape away from every surviving
 	// piece, that is on cancelled (interior) portions only. Covering is a resting contact idea and
 	// is not used here.
-	b2Vec2 p = b2InvTransformPoint( (b2Transform){ b2Vec2_zero, frameT.q }, b2SubPos( point, frameT.p ) );
+	b2Vec2 p = b2InvTransformPoint( (b2Transform){ b2Vec2_zero, frame.q }, b2SubPos( point, frame.p ) );
 	float tolerance = 4.0f * linTol;
 	bool onTouched = false;
-	for ( int i = 0; i < scene.touchedEdgeCount; ++i )
+	for ( int i = o->firstEdge; i < o->firstEdge + o->edgeCount; ++i )
 	{
-		const TopoEdge* e = scene.edges + i;
+		const TopoEdge* e = scene->edges + i;
 		if ( b2DistanceSquared( p, b2Lerp( e->p1, e->p2, b2ClampFloat( b2Dot( b2Sub( p, e->p1 ), b2Sub( e->p2, e->p1 ) ) /
 																		b2LengthSquared( b2Sub( e->p2, e->p1 ) ),
 																	0.0f, 1.0f ) ) ) < tolerance * tolerance )
@@ -1168,22 +1351,21 @@ bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point
 	}
 
 	// The hit is real if its normal matches a live face it lands on, or it lands on a live convex
-	// corner (judged with the topological ghosts). Normal oriented from the touched shape to the player.
-	b2Vec2 hitNormal = b2InvRotateVector( frameT.q, normal );
+	// corner (judged with the topological ghosts, covering ignored). Normal oriented from the
+	// touched shape to the player.
+	b2Vec2 hitNormal = b2InvRotateVector( frame.q, normal );
 	if ( playerIsA )
 	{
 		hitNormal = b2Neg( hitNormal );
 	}
 
-	for ( int i = 0; i < pieceCount; ++i )
-	{
-		if ( pieces[i].edgeIndex >= scene.touchedEdgeCount )
-		{
-			continue;
-		}
+	int ownerList[TOPO_MAX_NEIGHBORS + 1];
+	int listCount = CandidateOwners( scene, owner, ownerList );
 
-		b2Vec2 a = pieces[i].a;
-		b2Vec2 b = pieces[i].b;
+	for ( int i = o->firstPiece; i < o->firstPiece + o->pieceCount; ++i )
+	{
+		b2Vec2 a = scene->pieces[i].a;
+		b2Vec2 b = scene->pieces[i].b;
 		b2Vec2 d = b2Sub( b, a );
 		float t = b2ClampFloat( b2Dot( b2Sub( p, a ), d ) / b2LengthSquared( d ), 0.0f, 1.0f );
 		if ( b2DistanceSquared( p, b2MulAdd( a, t, d ) ) > tolerance * tolerance )
@@ -1199,7 +1381,7 @@ bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point
 
 		if ( b2DistanceSquared( p, a ) < tolerance * tolerance )
 		{
-			b2Vec2 ghost1 = FindGhost( &scene, pieces, NULL, pieceCount, i, true, linTol );
+			b2Vec2 ghost1 = FindGhost( scene, NULL, ownerList, listCount, i, true, linTol );
 			if ( b2Cross( b2Normalize( b2Sub( a, ghost1 ) ), edge1 ) >= context->config.angularTolerance )
 			{
 				return true;
@@ -1208,7 +1390,7 @@ bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point
 
 		if ( b2DistanceSquared( p, b ) < tolerance * tolerance )
 		{
-			b2Vec2 ghost2 = FindGhost( &scene, pieces, NULL, pieceCount, i, false, linTol );
+			b2Vec2 ghost2 = FindGhost( scene, NULL, ownerList, listCount, i, false, linTol );
 			if ( b2Cross( edge1, b2Normalize( b2Sub( ghost2, b ) ) ) >= context->config.angularTolerance )
 			{
 				return true;
@@ -1218,4 +1400,61 @@ bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point
 
 	context->stats.vetoed += 1;
 	return false;
+}
+
+bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* userContext )
+{
+	TopoGhostContext* context = userContext;
+
+	bool playerIsA = B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), context->playerId );
+	bool playerIsB = B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), context->playerId );
+	if ( playerIsA == playerIsB )
+	{
+		return true;
+	}
+
+	b2ShapeId playerShapeId = playerIsA ? shapeIdA : shapeIdB;
+	b2ShapeId touchedId = playerIsA ? shapeIdB : shapeIdA;
+	if ( IsSupportedPlayerType( b2Shape_GetType( playerShapeId ) ) == false )
+	{
+		return true;
+	}
+
+	// Continuous collision runs after the solve while other threads write body poses, so only the
+	// pre-step snapshot is used, and the topology is judged at the pre-step pose (the pose the
+	// player swept from), not at the unclamped end pose
+	const TopoStepScene* step = FindStepScene( context, playerShapeId );
+	int owner = step != NULL ? FindOwner( &step->scene, touchedId ) : -1;
+	if ( owner >= 0 )
+	{
+		if ( step->scene.overflow || step->scene.owners[owner].centroidInside )
+		{
+			return true;
+		}
+
+		return JudgeContinuous( context, &step->scene, owner, step->frame, point, normal, playerIsA );
+	}
+
+	// Fallback: build the local topology for this event
+	const TopoGhostShape* touched = FindSnapshot( context, touchedId );
+	if ( touched == NULL )
+	{
+		return true;
+	}
+
+	TopoOwner owners[TOPO_MAX_LOCAL_OWNERS];
+	TopoEdge edges[TOPO_MAX_LOCAL_EDGES];
+	TopoPiece pieces[TOPO_MAX_LOCAL_PIECES];
+	bool covered[TOPO_MAX_LOCAL_PIECES];
+	TopoScene scene;
+	InitScene( &scene, owners, TOPO_MAX_LOCAL_OWNERS, edges, TOPO_MAX_LOCAL_EDGES, pieces, covered, TOPO_MAX_LOCAL_PIECES,
+			   context->config.penetrationTolerance );
+	BuildLocalScene( &scene, context, touched, playerShapeId );
+	if ( scene.overflow || scene.owners[0].centroidInside )
+	{
+		return true;
+	}
+
+	ComputeTopology( &scene, &context->config, false, TOPO_GHOSTS_NONE );
+	return JudgeContinuous( context, &scene, 0, touched->transform, point, normal, playerIsA );
 }
