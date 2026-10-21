@@ -51,7 +51,8 @@ static GhostMetrics RunOnce( int scenarioIndex, GhostParams params )
 	worldDef.enableSleep = false;
 	b2WorldId worldId = b2CreateWorld( &worldDef );
 
-	GhostRun run;
+	// Static: GhostRun holds the topological ghost step scene (hundreds of KB), too big for the stack
+	static GhostRun run;
 	GhostRun_Create( &run, worldId, scenarioIndex, params );
 
 	int maxSteps = g_ghostScenarios[scenarioIndex].maxSteps;
@@ -97,7 +98,8 @@ static int Trace( const char* name, int variant, int mitigation, float sweepValu
 	worldDef.enableSleep = false;
 	b2WorldId worldId = b2CreateWorld( &worldDef );
 
-	GhostRun run;
+	// Static: GhostRun holds the topological ghost step scene (hundreds of KB), too big for the stack
+	static GhostRun run;
 	GhostRun_Create( &run, worldId, si, params );
 
 	printf( "step x y vx vy angle contacts\n" );
@@ -175,7 +177,8 @@ static int Bench( const char* name, int variant, int repeats )
 			worldDef.enableSleep = false;
 			b2WorldId worldId = b2CreateWorld( &worldDef );
 
-			GhostRun run;
+			// Static: too big for the stack, see RunOnce
+			static GhostRun run;
 			GhostRun_Create( &run, worldId, si, params );
 
 			uint64_t ticks = b2GetTicks();
