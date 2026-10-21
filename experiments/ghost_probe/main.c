@@ -5,6 +5,10 @@
 // Prints one markdown table per scenario.
 //
 // usage: ghost_probe [scenario name substring]
+//        ghost_probe --defaults
+//        ghost_probe --trace <scenario> <variant> <mitigation> <sweep value>
+//        ghost_probe --players <scenario> [<variant> <mitigation> <sweep value>]
+//        ghost_probe --bench <scenario> <variant> <repeats>
 
 #include "ghost_scenarios.h"
 
@@ -45,26 +49,35 @@ static const char* SweepName( const GhostScenario* scenario )
 	}
 }
 
-static GhostMetrics RunOnce( int scenarioIndex, GhostParams params )
+// Static: GhostRun holds the topological ghost step scene (hundreds of KB), too big for the stack
+static GhostRun s_run;
+
+// Run one configuration to the end. The result (metrics, per player metrics) stays valid until the next call.
+static const GhostRun* Simulate( int scenarioIndex, GhostParams params )
 {
 	b2WorldDef worldDef = b2DefaultWorldDef();
 	worldDef.enableSleep = false;
 	b2WorldId worldId = b2CreateWorld( &worldDef );
 
-	// Static: GhostRun holds the topological ghost step scene (hundreds of KB), too big for the stack
-	static GhostRun run;
-	GhostRun_Create( &run, worldId, scenarioIndex, params );
+	GhostRun* run = &s_run;
+	GhostRun_Create( run, worldId, scenarioIndex, params );
 
 	int maxSteps = g_ghostScenarios[scenarioIndex].maxSteps;
-	for ( int i = 0; i < maxSteps && run.metrics.finished == false; ++i )
+	for ( int i = 0; i < maxSteps && run->metrics.finished == false; ++i )
 	{
-		GhostRun_PreStep( &run );
+		GhostRun_PreStep( run );
 		b2World_Step( worldId, 1.0f / 60.0f, 4 );
-		GhostRun_Update( &run );
+		GhostRun_Update( run );
 	}
 
+	GhostRun_Destroy( run );
 	b2DestroyWorld( worldId );
-	return run.metrics;
+	return run;
+}
+
+static GhostMetrics RunOnce( int scenarioIndex, GhostParams params )
+{
+	return Simulate( scenarioIndex, params )->metrics;
 }
 
 static int FindScenario( const char* name )
@@ -77,6 +90,180 @@ static int FindScenario( const char* name )
 		}
 	}
 	return -1;
+}
+
+static const char* Verdict( const GhostScenario* scenario, int variant, const GhostMetrics* m );
+
+// Rest of a trace line: pose, velocity and touching manifolds of a body
+static void PrintBodyState( b2BodyId bodyId )
+{
+	b2Pos p = b2Body_GetPosition( bodyId );
+	b2Vec2 v = b2Body_GetLinearVelocity( bodyId );
+	float angle = b2Rot_GetAngle( b2Body_GetRotation( bodyId ) );
+	printf( " %.4f %.4f %.3f %.3f %.3f %d", (float)p.x, (float)p.y, v.x, v.y, angle, b2Body_GetContactCapacity( bodyId ) );
+
+	// Manifold normals (pointing away from the body) and point separations
+	b2ContactData contacts[8];
+	int contactCount = b2Body_GetContactData( bodyId, contacts, 8 );
+	for ( int j = 0; j < contactCount; ++j )
+	{
+		const b2Manifold* m = &contacts[j].manifold;
+		if ( m->pointCount == 0 )
+		{
+			continue;
+		}
+
+		b2Vec2 n = m->normal;
+		if ( B2_ID_EQUALS( b2Shape_GetBody( contacts[j].shapeIdA ), bodyId ) == false )
+		{
+			n = b2Neg( n );
+		}
+
+		b2ShapeId other =
+			B2_ID_EQUALS( b2Shape_GetBody( contacts[j].shapeIdA ), bodyId ) ? contacts[j].shapeIdB : contacts[j].shapeIdA;
+		static const char* typeNames[] = { "circle", "capsule", "segment", "polygon", "chainseg" };
+		static const char* bodyNames[] = { "static", "kinematic", "dynamic" };
+		b2AABB bounds = b2Shape_GetBounds( other );
+		printf( " | %s/%s x[%.2f,%.2f] y[%.2f,%.2f] n=(%.2f,%.2f)", typeNames[b2Shape_GetType( other )],
+				bodyNames[b2Body_GetType( b2Shape_GetBody( other ) )], bounds.lowerBound.x, bounds.upperBound.x,
+				bounds.lowerBound.y, bounds.upperBound.y, n.x, n.y );
+		for ( int k = 0; k < m->pointCount; ++k )
+		{
+			printf( " s=%.4f", m->points[k].separation );
+		}
+	}
+	printf( "\n" );
+}
+
+// Verdict of a player against the same player on the smooth reference surface: symptoms beyond
+// what the reference shows, with the absolute thresholds of Verdict as margins
+static const char* RelativeVerdict( const GhostMetrics* m, const GhostMetrics* ref )
+{
+	if ( m->fellThrough && ref->fellThrough == false )
+	{
+		return "FELL";
+	}
+	if ( m->finished == false && ref->finished )
+	{
+		return "STUCK";
+	}
+	if ( m->maxKick > ref->maxKick + 0.5f || m->maxHop > ref->maxHop + 0.1f )
+	{
+		return "bumpy";
+	}
+	if ( m->minSpeedRatio < ref->minSpeedRatio - 0.1f )
+	{
+		return "slowed";
+	}
+	return "ok";
+}
+
+// Per player metrics of the reference variant run without mitigation, when the scenario has one.
+// Returns false otherwise.
+static bool ReferencePlayers( int si, GhostParams params, GhostMetrics* out )
+{
+	const GhostScenario* scenario = g_ghostScenarios + si;
+	int reference = scenario->referenceVariant != NULL ? scenario->referenceVariant( params.variant ) : -1;
+	if ( reference < 0 )
+	{
+		return false;
+	}
+
+	params.variant = reference;
+	params.mitigation = ghostMitigation_none;
+	const GhostRun* run = Simulate( si, params );
+	for ( int i = 0; i < run->playerCount; ++i )
+	{
+		out[i] = run->players[i].metrics;
+	}
+	return true;
+}
+
+// One line per player of a multi-body run. reference: per player metrics on the smooth reference
+// surface, may be NULL.
+static void PrintPlayers( const GhostScenario* scenario, int variant, const GhostRun* run, const GhostMetrics* reference )
+{
+	printf( "| player | verdict | vs reference | done | time | minV | snags | hop | sink | kick | cull | fell |\n" );
+	printf( "|---|---|---|---|---|---|---|---|---|---|---|---|\n" );
+	for ( int i = 0; i < run->playerCount; ++i )
+	{
+		const GhostPlayer* player = run->players + i;
+		const GhostMetrics* m = &player->metrics;
+		const char* relative = reference != NULL ? RelativeVerdict( m, reference + i ) : "-";
+		char done[32];
+		if ( m->finished )
+		{
+			snprintf( done, sizeof( done ), "yes (%d)", m->steps );
+		}
+		else
+		{
+			snprintf( done, sizeof( done ), "no" );
+		}
+
+		printf( "| %s | %s | %s | %s | %.3f | %.3f | %d | %.4f | %.4f | %.3f | %d | %s |\n", player->label,
+				Verdict( scenario, variant, m ), relative, done, m->idealProgress > 0.0f ? m->progress / m->idealProgress : 0.0f,
+				m->minSpeedRatio == FLT_MAX ? 0.0f : m->minSpeedRatio, m->snagCount, m->maxHop, m->maxSink, m->maxKick,
+				m->rejectedCount, m->fellThrough ? "**yes**" : "no" );
+	}
+}
+
+static void RunPlayers( int si, int variant, int mitigation, float sweepValue )
+{
+	const GhostScenario* scenario = g_ghostScenarios + si;
+	GhostParams params = GhostDefaultParams( si );
+	params.variant = variant;
+	params.mitigation = (GhostMitigation)mitigation;
+	SetSweepValue( &params, scenario->sweepField, sweepValue );
+
+	// The reference run reuses the run storage, so it goes first
+	GhostMetrics reference[GHOST_MAX_PLAYERS];
+	bool hasReference = ReferencePlayers( si, params, reference );
+
+	const GhostRun* run = Simulate( si, params );
+	printf( "#### %s / %s / %s / %s %g\n\n", scenario->name, scenario->variantNames[variant],
+			GhostMitigationName( (GhostMitigation)mitigation ), SweepName( scenario ), sweepValue );
+	if ( run->playerCount == 0 )
+	{
+		printf( "single player scenario, see the main table\n\n" );
+		return;
+	}
+
+	PrintPlayers( scenario, variant, run, hasReference ? reference : NULL );
+	printf( "\n" );
+}
+
+// Per player results: one configuration, or every variant x mitigation x sweep value when variant < 0
+static int Players( const char* name, int variant, int mitigation, float sweepValue )
+{
+	int si = FindScenario( name );
+	if ( si < 0 )
+	{
+		printf( "no scenario matching '%s'\n", name );
+		return 1;
+	}
+
+	if ( variant >= 0 )
+	{
+		RunPlayers( si, variant, mitigation, sweepValue );
+		return 0;
+	}
+
+	const GhostScenario* scenario = g_ghostScenarios + si;
+	for ( int vi = 0; vi < scenario->variantCount; ++vi )
+	{
+		for ( int mi = 0; mi < ghostMitigation_count; ++mi )
+		{
+			if ( scenario->mitigationMask & GHOST_MITIGATE( mi ) )
+			{
+				for ( int wi = 0; wi < scenario->sweepCount; ++wi )
+				{
+					RunPlayers( si, vi, mi, scenario->sweep[wi] );
+				}
+			}
+		}
+	}
+
+	return 0;
 }
 
 // Print the player state every step for one configuration
@@ -102,52 +289,50 @@ static int Trace( const char* name, int variant, int mitigation, float sweepValu
 	static GhostRun run;
 	GhostRun_Create( &run, worldId, si, params );
 
-	printf( "step x y vx vy angle contacts\n" );
+	if ( run.playerCount > 0 )
+	{
+		printf( "step player kick hop x y vx vy angle contacts\n" );
+	}
+	else
+	{
+		printf( "step x y vx vy angle contacts\n" );
+	}
 	for ( int i = 0; i < g_ghostScenarios[si].maxSteps && run.metrics.finished == false; ++i )
 	{
 		GhostRun_PreStep( &run );
 		b2World_Step( worldId, 1.0f / 60.0f, 4 );
 		GhostRun_Update( &run );
 
-		b2Pos p = b2Body_GetPosition( run.playerId );
-		b2Vec2 v = b2Body_GetLinearVelocity( run.playerId );
-		float angle = b2Rot_GetAngle( b2Body_GetRotation( run.playerId ) );
-		printf( "%d %.4f %.4f %.3f %.3f %.3f %d", i + 1, (float)p.x, (float)p.y, v.x, v.y, angle,
-				b2Body_GetContactCapacity( run.playerId ) );
-
-		// Manifold normals (pointing away from the player) and point separations
-		b2ContactData contacts[8];
-		int contactCount = b2Body_GetContactData( run.playerId, contacts, 8 );
-		for ( int j = 0; j < contactCount; ++j )
+		if ( run.playerCount == 0 )
 		{
-			const b2Manifold* m = &contacts[j].manifold;
-			if ( m->pointCount == 0 )
+			printf( "%d", i + 1 );
+			PrintBodyState( run.playerId );
+			continue;
+		}
+
+		// Multi-body: one line per moving player, with its running max kick and hop
+		for ( int j = 0; j < run.playerCount; ++j )
+		{
+			const GhostPlayer* player = run.players + j;
+			if ( player->launched == false || b2Body_IsEnabled( player->bodyId ) == false )
 			{
 				continue;
 			}
 
-			b2Vec2 n = m->normal;
-			if ( B2_ID_EQUALS( b2Shape_GetBody( contacts[j].shapeIdA ), run.playerId ) == false )
-			{
-				n = b2Neg( n );
-			}
-
-			b2ShapeId other = B2_ID_EQUALS( b2Shape_GetBody( contacts[j].shapeIdA ), run.playerId ) ? contacts[j].shapeIdB
-																								  : contacts[j].shapeIdA;
-			static const char* typeNames[] = { "circle", "capsule", "segment", "polygon", "chainseg" };
-			static const char* bodyNames[] = { "static", "kinematic", "dynamic" };
-			b2AABB bounds = b2Shape_GetBounds( other );
-			printf( " | %s/%s x[%.2f,%.2f] y[%.2f,%.2f] n=(%.2f,%.2f)", typeNames[b2Shape_GetType( other )],
-					bodyNames[b2Body_GetType( b2Shape_GetBody( other ) )], bounds.lowerBound.x, bounds.upperBound.x,
-					bounds.lowerBound.y, bounds.upperBound.y, n.x, n.y );
-			for ( int k = 0; k < m->pointCount; ++k )
-			{
-				printf( " s=%.4f", m->points[k].separation );
-			}
+			printf( "%d %s kick=%.3f hop=%.4f", i + 1, player->label, player->metrics.maxKick, player->metrics.maxHop );
+			PrintBodyState( player->bodyId );
 		}
-		printf( "\n" );
 	}
 
+	if ( run.playerCount > 0 )
+	{
+		GhostMetrics reference[GHOST_MAX_PLAYERS];
+		bool hasReference = ReferencePlayers( si, params, reference );
+		printf( "\n" );
+		PrintPlayers( g_ghostScenarios + si, variant, &run, hasReference ? reference : NULL );
+	}
+
+	GhostRun_Destroy( &run );
 	b2DestroyWorld( worldId );
 	return 0;
 }
@@ -190,6 +375,7 @@ static int Bench( const char* name, int variant, int repeats )
 			milliseconds += b2GetMilliseconds( ticks );
 			steps += g_ghostScenarios[si].maxSteps;
 
+			GhostRun_Destroy( &run );
 			b2DestroyWorld( worldId );
 		}
 
@@ -285,6 +471,17 @@ int main( int argc, char** argv )
 	if ( argc == 6 && strcmp( argv[1], "--trace" ) == 0 )
 	{
 		return Trace( argv[2], atoi( argv[3] ), atoi( argv[4] ), (float)atof( argv[5] ) );
+	}
+
+	// Multi-body scenarios, one line per player:
+	// ghost_probe --players <scenario> [<variant> <mitigation> <sweep value>]
+	if ( argc == 6 && strcmp( argv[1], "--players" ) == 0 )
+	{
+		return Players( argv[2], atoi( argv[3] ), atoi( argv[4] ), (float)atof( argv[5] ) );
+	}
+	if ( argc == 3 && strcmp( argv[1], "--players" ) == 0 )
+	{
+		return Players( argv[2], -1, 0, 0.0f );
 	}
 
 	const char* filter = argc > 1 ? argv[1] : NULL;

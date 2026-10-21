@@ -34,14 +34,33 @@ public:
 		Launch();
 	}
 
+	~GhostCollisionSample() override
+	{
+		GhostRun_Destroy( &m_run );
+	}
+
 	void Launch()
 	{
 		GhostRun_Create( &m_run, m_worldId, ScenarioIndex, s_params );
 		if ( s_follow )
 		{
-			b2Pos p = b2Body_GetPosition( m_run.playerId );
+			b2Pos p = b2Body_GetPosition( FollowedBody() );
 			m_context->camera.center = { p.x, p.y + 1.0f };
 		}
+	}
+
+	// Multi-body scenarios: the first player still moving, else the last one
+	b2BodyId FollowedBody() const
+	{
+		for ( int i = 0; i < m_run.playerCount; ++i )
+		{
+			const GhostPlayer& player = m_run.players[i];
+			if ( player.launched && player.metrics.finished == false )
+			{
+				return player.bodyId;
+			}
+		}
+		return m_run.playerCount > 0 ? m_run.players[m_run.playerCount - 1].bodyId : m_run.playerId;
 	}
 
 	bool DrawControls() override
@@ -109,6 +128,7 @@ public:
 		if ( m_relaunch )
 		{
 			m_relaunch = false;
+			GhostRun_Destroy( &m_run );
 			CreateWorld();
 			m_mouseJointId = b2_nullJointId;
 			Launch();
@@ -124,7 +144,7 @@ public:
 
 		if ( s_follow )
 		{
-			b2Pos p = b2Body_GetPosition( m_run.playerId );
+			b2Pos p = b2Body_GetPosition( FollowedBody() );
 			m_context->camera.center = { p.x, p.y + 1.0f };
 		}
 
@@ -138,6 +158,17 @@ public:
 		DrawScreenTextLine( "min speed ratio %.3f, snags %d", m.minSpeedRatio > 1e30f ? 1.0f : m.minSpeedRatio, m.snagCount );
 		DrawScreenTextLine( "max hop %.4f, max sink %.4f, max kick %.3f", m.maxHop, m.maxSink, m.maxKick );
 		DrawScreenTextLine( "culled contacts %d%s", m.rejectedCount, m.fellThrough ? ", FELL THROUGH" : "" );
+
+		// Multi-body scenarios: the lines above show the worst player, then one line per player
+		for ( int i = 0; i < m_run.playerCount; ++i )
+		{
+			const GhostPlayer& player = m_run.players[i];
+			const GhostMetrics& pm = player.metrics;
+			const char* state = player.launched == false ? "waiting" : ( pm.finished ? "finished" : "moving" );
+			DrawScreenTextLine( "%-8s %-8s kick %.2f hop %.3f minV %.2f snags %d progress %.1f%s", player.label, state,
+								pm.maxKick, pm.maxHop, pm.minSpeedRatio > 1e30f ? 1.0f : pm.minSpeedRatio, pm.snagCount,
+								pm.progress, pm.fellThrough ? " FELL" : "" );
+		}
 	}
 
 	static Sample* Create( SampleContext* context )
@@ -193,3 +224,4 @@ static int sampleGhost27 = RegisterGhostCollision<27>();
 static int sampleGhost28 = RegisterGhostCollision<28>();
 static int sampleGhost29 = RegisterGhostCollision<29>();
 static int sampleGhost30 = RegisterGhostCollision<30>();
+static int sampleGhost31 = RegisterGhostCollision<31>();

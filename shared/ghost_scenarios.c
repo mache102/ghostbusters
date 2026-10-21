@@ -9,6 +9,7 @@
 #include <float.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 // Tags floor tiles so the CCD filter can recognize them, same as the upstream Ghost Culling sample
 #define GHOST_FLOOR_MATERIAL 42
@@ -132,10 +133,10 @@ static void BuildFlatFloor( b2BodyId groundId, FloorKind kind, float x0, int cou
 	}
 }
 
-// Pre-solve mitigation: Semrau's shallow face-contact cull, as in the upstream Ghost Culling sample
-static void GhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context )
+// Pre-solve mitigation: Semrau's shallow face-contact cull, as in the upstream Ghost Culling sample.
+// Applies to contacts of playerId, counts culled manifolds in rejectedCount.
+static void SemrauPreSolve( b2BodyId playerId, int* rejectedCount, b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold )
 {
-	GhostRun* run = context;
 	if ( manifold->pointCount != 2 )
 	{
 		return;
@@ -143,10 +144,10 @@ static void GhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* m
 
 	b2Vec2 normal = manifold->normal;
 	b2BodyId bodyIdA = b2Shape_GetBody( shapeIdA );
-	if ( B2_ID_EQUALS( bodyIdA, run->playerId ) == false )
+	if ( B2_ID_EQUALS( bodyIdA, playerId ) == false )
 	{
 		b2BodyId bodyIdB = b2Shape_GetBody( shapeIdB );
-		if ( B2_ID_EQUALS( bodyIdB, run->playerId ) == false )
+		if ( B2_ID_EQUALS( bodyIdB, playerId ) == false )
 		{
 			return;
 		}
@@ -154,7 +155,7 @@ static void GhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* m
 		normal = b2Neg( normal );
 	}
 
-	b2Vec2 velocity = b2Body_GetLinearVelocity( run->playerId );
+	b2Vec2 velocity = b2Body_GetLinearVelocity( playerId );
 	if ( b2Dot( normal, velocity ) < 0.0f )
 	{
 		return;
@@ -166,27 +167,24 @@ static void GhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* m
 		manifold->pointCount = 0;
 
 		// Diagnostic only. The headless probe is single threaded.
-		run->metrics.rejectedCount += 1;
+		*rejectedCount += 1;
 	}
 }
 
-// CCD mitigation: drop horizontal TOI hits against floor tiles
-static bool GhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* context )
+// CCD mitigation: drop horizontal TOI hits of playerId against floor tiles
+static bool SemrauPreContinuous( b2BodyId playerId, int* rejectedCount, b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Vec2 normal )
 {
-	(void)point;
-	GhostRun* run = context;
-
 	if ( b2AbsFloat( normal.y ) > 0.1f )
 	{
 		return true;
 	}
 
 	b2ShapeId otherId;
-	if ( B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), run->playerId ) )
+	if ( B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), playerId ) )
 	{
 		otherId = shapeIdB;
 	}
-	else if ( B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), run->playerId ) )
+	else if ( B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), playerId ) )
 	{
 		otherId = shapeIdA;
 	}
@@ -197,11 +195,79 @@ static bool GhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos po
 
 	if ( b2Shape_GetUserMaterial( otherId ) == GHOST_FLOOR_MATERIAL )
 	{
-		run->metrics.rejectedCount += 1;
+		*rejectedCount += 1;
 		return false;
 	}
 
 	return true;
+}
+
+static void GhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context )
+{
+	GhostRun* run = context;
+	SemrauPreSolve( run->playerId, &run->metrics.rejectedCount, shapeIdA, shapeIdB, manifold );
+}
+
+static bool GhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* context )
+{
+	(void)point;
+	GhostRun* run = context;
+	return SemrauPreContinuous( run->playerId, &run->metrics.rejectedCount, shapeIdA, shapeIdB, normal );
+}
+
+// Multi-body scenarios: the player whose body is on either side of the contact, NULL if none.
+// Players never collide with each other.
+static GhostPlayer* FindContactPlayer( GhostRun* run, b2ShapeId shapeIdA, b2ShapeId shapeIdB )
+{
+	b2BodyId bodyIdA = b2Shape_GetBody( shapeIdA );
+	b2BodyId bodyIdB = b2Shape_GetBody( shapeIdB );
+	for ( int i = 0; i < run->playerCount; ++i )
+	{
+		GhostPlayer* player = run->players + i;
+		if ( B2_ID_EQUALS( bodyIdA, player->bodyId ) || B2_ID_EQUALS( bodyIdB, player->bodyId ) )
+		{
+			return player;
+		}
+	}
+	return NULL;
+}
+
+// Box2D has one pre-solve and one pre-continuous callback per world: these forward each contact to
+// the mitigation state of the player involved
+static void MultiPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context )
+{
+	GhostRun* run = context;
+	GhostPlayer* player = FindContactPlayer( run, shapeIdA, shapeIdB );
+	if ( player == NULL )
+	{
+		return;
+	}
+
+	if ( run->params.mitigation == ghostMitigation_topological )
+	{
+		TopoGhostPreSolve( shapeIdA, shapeIdB, manifold, player->topo );
+	}
+	else
+	{
+		SemrauPreSolve( player->bodyId, &player->metrics.rejectedCount, shapeIdA, shapeIdB, manifold );
+	}
+}
+
+static bool MultiPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* context )
+{
+	GhostRun* run = context;
+	GhostPlayer* player = FindContactPlayer( run, shapeIdA, shapeIdB );
+	if ( player == NULL )
+	{
+		return true;
+	}
+
+	if ( run->params.mitigation == ghostMitigation_topological )
+	{
+		return TopoGhostPreContinuous( shapeIdA, shapeIdB, point, normal, player->topo );
+	}
+
+	return SemrauPreContinuous( player->bodyId, &player->metrics.rejectedCount, shapeIdA, shapeIdB, normal );
 }
 
 typedef struct PlayerDef
@@ -779,13 +845,15 @@ static void CreateRotatingPlatform( GhostRun* run )
 // Platformer slope: a locked box slides down a 30 degree slope made of right triangle tiles
 // (marblebuilds b23_planck_ramp style: hypotenuse on top, vertical side at each seam) or the
 // same slope as a polyline.
-static void CreateSlopeTiles( GhostRun* run )
+#define SLOPE_ANGLE ( 30.0f * B2_PI / 180.0f )
+
+// 30 degree slope from the origin down to the right, 30 m long: right triangle tiles (1 m) or a
+// polyline through the same points
+static void BuildSlope( GhostRun* run, bool triangleTiles, float friction )
 {
 	const int tileCount = 30;
 	const float tileLength = 1.0f;
-	const float slope = 30.0f * B2_PI / 180.0f;
-	b2Vec2 down = { cosf( slope ), -sinf( slope ) };
-	b2Vec2 up = b2LeftPerp( down );
+	b2Vec2 down = { cosf( SLOPE_ANGLE ), -sinf( SLOPE_ANGLE ) };
 
 	b2Vec2 points[31];
 	for ( int i = 0; i <= tileCount; ++i )
@@ -793,11 +861,10 @@ static void CreateSlopeTiles( GhostRun* run )
 		points[i] = b2MulSV( i * tileLength, down );
 	}
 
-	// Variants: even = triangle tiles, odd = chain. 0/1 locked box, 2/3 rolling ball, 4/5 free box
 	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	if ( ( run->params.variant & 1 ) == 0 )
+	if ( triangleTiles )
 	{
-		b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
+		b2ShapeDef shapeDef = FloorShapeDef( friction );
 		for ( int i = 0; i < tileCount; ++i )
 		{
 			b2Vec2 v[3] = { points[i], points[i + 1], { points[i].x, points[i + 1].y } };
@@ -808,8 +875,18 @@ static void CreateSlopeTiles( GhostRun* run )
 	}
 	else
 	{
-		AddPolyline( groundId, points, tileCount + 1, 0.0f );
+		AddPolyline( groundId, points, tileCount + 1, friction );
 	}
+}
+
+static void CreateSlopeTiles( GhostRun* run )
+{
+	const float slope = SLOPE_ANGLE;
+	b2Vec2 down = { cosf( slope ), -sinf( slope ) };
+	b2Vec2 up = b2LeftPerp( down );
+
+	// Variants: even = triangle tiles, odd = chain. 0/1 locked box, 2/3 rolling ball, 4/5 free box
+	BuildSlope( run, ( run->params.variant & 1 ) == 0, 0.0f );
 
 	int player = run->params.variant / 2;
 	float h = player == 1 ? 0.3f : 0.5f;
@@ -862,11 +939,12 @@ static void CreateCompoundPlayer( GhostRun* run )
 
 // A rolling circle with friction crossing resting dynamic crates (polygon seams that carry no
 // ghost information) or static box tiles
-static void CreateCrateFloorCircle( GhostRun* run )
+// Static slab with 20 resting dynamic crates (2 m x 0.5 m, tops at y = 0, from x = -2 to 38), or
+// static box tiles
+static void BuildCrateFloor( GhostRun* run, bool dynamicCrates, float friction )
 {
-	const float friction = 0.6f;
 	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	if ( run->params.variant == 0 )
+	if ( dynamicCrates )
 	{
 		b2ShapeDef shapeDef = FloorShapeDef( friction );
 		b2Polygon slab = b2MakeOffsetBox( 40.0f, 0.5f, (b2Vec2){ 20.0f, -1.0f }, b2Rot_identity );
@@ -890,6 +968,12 @@ static void CreateCrateFloorCircle( GhostRun* run )
 	{
 		BuildFlatFloor( groundId, floor_boxTiles, -2.0f, 20, 2.0f, 0.0f, 0.0f, friction );
 	}
+}
+
+static void CreateCrateFloorCircle( GhostRun* run )
+{
+	const float friction = 0.6f;
+	BuildCrateFloor( run, run->params.variant == 0, friction );
 
 	const float radius = 0.25f;
 	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, radius } );
@@ -1550,6 +1634,14 @@ static float ParabolaFloor( float x )
 	return 0.125f * x * x;
 }
 
+// Curvature of the floor and of the crate tops (the floor shifted up)
+static float ParabolaCurvature( float x )
+{
+	float slope = 0.25f * x;
+	float s = sqrtf( 1.0f + slope * slope );
+	return 0.25f / ( s * s * s );
+}
+
 // Measure against the crate top polyline. Expected speed: energy conservation for a rolling disk
 // (kinetic energy 3/4 m v^2) relative to the launch point, which ignores the geometric loss at the
 // polyline corners (compare against the smooth chain variant).
@@ -1563,7 +1655,11 @@ static GhostLocalFrame ParabolaFrame( const GhostRun* run, b2Vec2 position )
 	return frame;
 }
 
-static void CreateParabolaCrates( GhostRun* run )
+// Builds the parabola floor, rim walls and the crate band (kind 0: dynamic crates, 1: static
+// crates, 2: smooth reference polyline along the crate tops). Sets the run's surface polyline to
+// the crate tops and returns the arc length from the start of the first crate top to the start of
+// the last one, where a run is finished.
+static float BuildParabolaCrates( GhostRun* run, int kind, float friction )
 {
 	// Relative crate widths and cut skews (top x - bottom x), deterministic and uneven
 	static const float widths[PARABOLA_CRATE_COUNT] = { 1.0f, 1.3f, 0.8f, 1.15f, 0.9f, 1.25f, 0.85f,
@@ -1594,7 +1690,7 @@ static void CreateParabolaCrates( GhostRun* run )
 	}
 
 	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	AddPolyline( groundId, bottom, PARABOLA_CRATE_COUNT + 1, PARABOLA_FRICTION );
+	AddPolyline( groundId, bottom, PARABOLA_CRATE_COUNT + 1, friction );
 
 	// Rim walls clear of the crates keep the ball in the bowl after it finishes (sample only, the
 	// probe stops at the path end before reaching them)
@@ -1606,11 +1702,10 @@ static void CreateParabolaCrates( GhostRun* run )
 		b2CreatePolygonShape( groundId, &wallDef, &right );
 	}
 
-	int variant = run->params.variant;
-	if ( variant == 2 )
+	if ( kind == 2 )
 	{
 		// Reference: the crate top surface as one chain-like polyline, no crates
-		AddPolyline( groundId, top, PARABOLA_CRATE_COUNT + 1, PARABOLA_FRICTION );
+		AddPolyline( groundId, top, PARABOLA_CRATE_COUNT + 1, friction );
 	}
 	else
 	{
@@ -1620,8 +1715,8 @@ static void CreateParabolaCrates( GhostRun* run )
 			b2Hull hull = b2ComputeHull( quad, 4 );
 			B2_ASSERT( hull.count == 4 );
 
-			b2ShapeDef shapeDef = FloorShapeDef( PARABOLA_FRICTION );
-			if ( variant == 0 )
+			b2ShapeDef shapeDef = FloorShapeDef( friction );
+			if ( kind == 0 )
 			{
 				// Dynamic crate whose body origin is its first bottom vertex
 				b2BodyDef bodyDef = b2DefaultBodyDef();
@@ -1647,17 +1742,6 @@ static void CreateParabolaCrates( GhostRun* run )
 		}
 	}
 
-	// Rolling ball launched down the local tangent of the first crate top
-	const float radius = 0.25f;
-	b2Vec2 tangent = b2Normalize( b2Sub( top[1], top[0] ) );
-	b2Vec2 start = b2MulAdd( b2Lerp( top[0], top[1], 0.5f ), radius, b2LeftPerp( tangent ) );
-	PlayerDef def = DefaultPlayerDef( run, start );
-	def.velocity = b2MulSV( run->params.speed, tangent );
-	def.angularVelocity = -run->params.speed / radius;
-	def.lockRotation = false;
-	def.friction = 0.6f;
-	CreatePlayerCircle( run, &def, radius );
-
 	B2_ASSERT( PARABOLA_CRATE_COUNT + 1 <= GHOST_MAX_SURFACE_POINTS );
 	float arcLength = 0.0f;
 	for ( int i = 0; i <= PARABOLA_CRATE_COUNT; ++i )
@@ -1669,11 +1753,312 @@ static void CreateParabolaCrates( GhostRun* run )
 		}
 	}
 	run->surfacePointCount = PARABOLA_CRATE_COUNT + 1;
+	return arcLength;
+}
+
+static void CreateParabolaCrates( GhostRun* run )
+{
+	float arcLength = BuildParabolaCrates( run, run->params.variant, PARABOLA_FRICTION );
+	const b2Vec2* top = run->surfacePoints;
+
+	// Rolling ball launched down the local tangent of the first crate top
+	const float radius = 0.25f;
+	b2Vec2 tangent = b2Normalize( b2Sub( top[1], top[0] ) );
+	b2Vec2 start = b2MulAdd( b2Lerp( top[0], top[1], 0.5f ), radius, b2LeftPerp( tangent ) );
+	PlayerDef def = DefaultPlayerDef( run, start );
+	def.velocity = b2MulSV( run->params.speed, tangent );
+	def.angularVelocity = -run->params.speed / radius;
+	def.lockRotation = false;
+	def.friction = 0.6f;
+	CreatePlayerCircle( run, &def, radius );
 
 	// Finished at the start of the last crate top, on the far rim (x ~ 3)
 	SetFlatFrame( run, radius, 0.5f, arcLength, radius );
 	run->origin = start;
 	run->localFrame = ParabolaFrame;
+}
+
+// Shape Parade: one body of each shape (circle, capsule, triangle, pentagon, hexagon, box) crosses
+// the same surface, each protected by the selected mitigation and measured separately (see
+// GhostRun::players). The bodies start at the same point, never collide with each other and are
+// launched PARADE_LAUNCH_INTERVAL steps apart, so a dynamic surface carries one body at a time.
+// A body is disabled once it finishes, so it cannot roll back into the path of later bodies.
+// The circle rolls; the other shapes slide, driven by a force that cancels their sliding friction
+// (StepShapeParade), so on a smooth surface they keep their speed like the circle. Players are
+// measured at their lowest point (see GhostRun::players). The probe's --players mode judges each
+// body against the same body on the smooth reference surface (ShapeParadeReference).
+#define PARADE_FRICTION 0.6f
+
+// Mixed with the body friction: sqrt( 0.6 * 0.4 ) = 0.49, below the tipping ratio of every parade
+// polygon (half face / inradius = tan( pi / n ): hexagon 0.577), so driven polygons slide instead of
+// tumbling on a smooth surface. Tumbling is real motion that reads as hops and kicks.
+#define PARADE_SURFACE_FRICTION 0.4f
+#define PARADE_LAUNCH_INTERVAL 30
+#define PARADE_POLYGON_RADIUS 0.3f
+
+typedef enum ParadeSurface
+{
+	parade_parabolaDynamic,
+	parade_parabolaStatic,
+	parade_parabolaChain,
+	parade_slopeTiles,
+	parade_slopeChain,
+	parade_crateFloor,
+	parade_flatChain,
+} ParadeSurface;
+
+// Support point of a shape: its farthest point along direction (pass -normal for the lowest point)
+static b2Vec2 ShapeSupportPoint( b2ShapeId shapeId, b2Transform xf, b2Vec2 direction )
+{
+	switch ( b2Shape_GetType( shapeId ) )
+	{
+		case b2_circleShape:
+		{
+			b2Circle circle = b2Shape_GetCircle( shapeId );
+			return b2MulAdd( b2TransformPoint( xf, circle.center ), circle.radius, direction );
+		}
+
+		case b2_capsuleShape:
+		{
+			b2Capsule capsule = b2Shape_GetCapsule( shapeId );
+			b2Vec2 p1 = b2TransformPoint( xf, capsule.center1 );
+			b2Vec2 p2 = b2TransformPoint( xf, capsule.center2 );
+			b2Vec2 p = b2Dot( p1, direction ) >= b2Dot( p2, direction ) ? p1 : p2;
+			return b2MulAdd( p, capsule.radius, direction );
+		}
+
+		case b2_polygonShape:
+		{
+			b2Polygon polygon = b2Shape_GetPolygon( shapeId );
+			b2Vec2 best = b2TransformPoint( xf, polygon.vertices[0] );
+			for ( int i = 1; i < polygon.count; ++i )
+			{
+				b2Vec2 p = b2TransformPoint( xf, polygon.vertices[i] );
+				if ( b2Dot( p, direction ) > b2Dot( best, direction ) )
+				{
+					best = p;
+				}
+			}
+			return b2MulAdd( best, polygon.radius, direction );
+		}
+
+		default:
+			return xf.p;
+	}
+}
+
+// Regular polygon with circumradius r lying on a face (bottom face parallel to the x axis)
+static b2Polygon MakeRegularPolygon( int count, float r )
+{
+	b2Vec2 points[B2_MAX_POLYGON_VERTICES];
+	for ( int i = 0; i < count; ++i )
+	{
+		float angle = -0.5f * B2_PI + B2_PI / count + 2.0f * B2_PI * i / count;
+		points[i] = (b2Vec2){ r * cosf( angle ), r * sinf( angle ) };
+	}
+	b2Hull hull = b2ComputeHull( points, count );
+	return b2MakePolygon( &hull, 0.0f );
+}
+
+// Adds a player lying on the surface at surfacePoint (tangent = direction of travel, the surface
+// normal is its left perpendicular). restHeight is the center height when lying on a face (radius
+// for round shapes, inradius for polygons).
+static void AddParadePlayer( GhostRun* run, const char* label, b2ShapeType type, const void* geometry, float restHeight,
+							 b2Vec2 surfacePoint, b2Vec2 tangent )
+{
+	B2_ASSERT( run->playerCount < GHOST_MAX_PLAYERS );
+	int index = run->playerCount;
+	GhostPlayer* player = run->players + index;
+	run->playerCount += 1;
+
+	player->label = label;
+	player->restHeight = restHeight;
+	player->launchStep = index * PARADE_LAUNCH_INTERVAL;
+	player->launchPosition = b2MulAdd( surfacePoint, restHeight, b2LeftPerp( tangent ) );
+	player->launchVelocity = b2MulSV( run->params.speed, tangent );
+
+	// The circle starts rolling, the others start sliding (they may still tip over and tumble)
+	player->launchAngularVelocity = type == b2_circleShape ? -run->params.speed / restHeight : 0.0f;
+
+	bool mitigated = run->params.mitigation != ghostMitigation_none;
+	b2BodyDef bodyDef = b2DefaultBodyDef();
+	bodyDef.type = b2_dynamicBody;
+	bodyDef.position = ToPos( player->launchPosition );
+	bodyDef.rotation = b2MakeRot( b2Atan2( tangent.y, tangent.x ) );
+	bodyDef.gravityScale = run->params.gravityScale;
+	bodyDef.enableSleep = false;
+	bodyDef.isEnabled = player->launchStep == 0;
+	bodyDef.linearVelocity = player->launchVelocity;
+	bodyDef.angularVelocity = player->launchAngularVelocity;
+	if ( mitigated )
+	{
+		// Pre-solve must see a fresh manifold at every seam
+		bodyDef.enableContactRecycling = false;
+	}
+	player->bodyId = b2CreateBody( run->worldId, &bodyDef );
+
+	b2ShapeDef shapeDef = b2DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.material.friction = PARADE_FRICTION;
+	shapeDef.filter.groupIndex = -1; // players never collide with each other
+	shapeDef.enablePreSolveEvents = mitigated;
+	switch ( type )
+	{
+		case b2_circleShape:
+			player->shapeId = b2CreateCircleShape( player->bodyId, &shapeDef, geometry );
+			break;
+		case b2_capsuleShape:
+			player->shapeId = b2CreateCapsuleShape( player->bodyId, &shapeDef, geometry );
+			break;
+		default:
+			player->shapeId = b2CreatePolygonShape( player->bodyId, &shapeDef, geometry );
+			break;
+	}
+
+	float mass = b2Body_GetMass( player->bodyId );
+	if ( type == b2_circleShape )
+	{
+		player->energyFactor = 1.0f + b2Body_GetRotationalInertia( player->bodyId ) / ( mass * restHeight * restHeight );
+	}
+	else
+	{
+		// Same mixing rule as Box2D: sqrt( frictionA * frictionB )
+		float friction = sqrtf( PARADE_FRICTION * PARADE_SURFACE_FRICTION );
+		float gravity = b2Length( b2World_GetGravity( run->worldId ) ) * run->params.gravityScale;
+		player->energyFactor = 1.0f;
+		player->driveForce = friction * mass * gravity;
+	}
+
+	if ( index == 0 )
+	{
+		run->playerId = player->bodyId;
+		run->playerShapeId = player->shapeId;
+		player->topo = &run->topo;
+		TopoGhost_Init( player->topo, run->worldId, player->bodyId );
+	}
+	else if ( run->params.mitigation == ghostMitigation_topological )
+	{
+		// Each player needs its own step topology. Freed in GhostRun_Destroy.
+		player->topo = malloc( sizeof( TopoGhostContext ) );
+		B2_ASSERT( player->topo != NULL );
+		TopoGhost_Init( player->topo, run->worldId, player->bodyId );
+	}
+}
+
+// The parade bodies, all starting at surfacePoint
+static void AddParadePlayers( GhostRun* run, b2Vec2 surfacePoint, b2Vec2 tangent )
+{
+	const float r = PARADE_POLYGON_RADIUS;
+
+	b2Circle circle = { b2Vec2_zero, 0.25f };
+	AddParadePlayer( run, "circle", b2_circleShape, &circle, circle.radius, surfacePoint, tangent );
+
+	b2Capsule capsule = { { -0.25f, 0.0f }, { 0.25f, 0.0f }, 0.15f };
+	AddParadePlayer( run, "capsule", b2_capsuleShape, &capsule, capsule.radius, surfacePoint, tangent );
+
+	b2Polygon triangle = MakeRegularPolygon( 3, r );
+	AddParadePlayer( run, "triangle", b2_polygonShape, &triangle, r * cosf( B2_PI / 3.0f ), surfacePoint, tangent );
+
+	b2Polygon pentagon = MakeRegularPolygon( 5, r );
+	AddParadePlayer( run, "pentagon", b2_polygonShape, &pentagon, r * cosf( B2_PI / 5.0f ), surfacePoint, tangent );
+
+	b2Polygon hexagon = MakeRegularPolygon( 6, r );
+	AddParadePlayer( run, "hexagon", b2_polygonShape, &hexagon, r * cosf( B2_PI / 6.0f ), surfacePoint, tangent );
+
+	b2Polygon box = b2MakeBox( 0.25f, 0.25f );
+	AddParadePlayer( run, "box", b2_polygonShape, &box, 0.25f, surfacePoint, tangent );
+
+	if ( run->params.mitigation != ghostMitigation_none )
+	{
+		b2World_SetPreSolveCallback( run->worldId, MultiPreSolve, MultiPreContinuous, run );
+	}
+}
+
+// Parabola frame with the expected speed of the player being measured: energy conservation from
+// its launch point with its own energy factor (rolling circle: 3/2; driven sliding shapes: 1, the
+// drive cancels their friction). Flat faces still lose speed at every polyline vertex they rock
+// across, so compare sliding shapes against the smooth chain variant.
+static GhostLocalFrame ParadeParabolaFrame( const GhostRun* run, b2Vec2 position )
+{
+	GhostLocalFrame frame = GhostPolylineFrame( run, position );
+	const GhostPlayer* player = run->players + run->framePlayer;
+	float g = -b2World_GetGravity( run->worldId ).y * run->params.gravityScale;
+	float v0 = run->params.speed;
+	float v2 = v0 * v0 + 2.0f * g * ( player->launchPosition.y - position.y ) / player->energyFactor;
+	frame.expectedSpeed = b2MaxFloat( sqrtf( b2MaxFloat( v2, 0.0f ) ), 0.5f );
+	return frame;
+}
+
+static int ShapeParadeReference( int variant )
+{
+	switch ( (ParadeSurface)variant )
+	{
+		case parade_parabolaDynamic:
+		case parade_parabolaStatic:
+		case parade_parabolaChain:
+			return parade_parabolaChain;
+		case parade_slopeTiles:
+		case parade_slopeChain:
+			return parade_slopeChain;
+		case parade_crateFloor:
+		case parade_flatChain:
+			return parade_flatChain;
+		default:
+			return -1;
+	}
+}
+
+static void StepShapeParade( GhostRun* run );
+
+static void CreateShapeParade( GhostRun* run )
+{
+	switch ( (ParadeSurface)run->params.variant )
+	{
+		case parade_parabolaDynamic:
+		case parade_parabolaStatic:
+		case parade_parabolaChain:
+		{
+			float arcLength = BuildParabolaCrates( run, run->params.variant - parade_parabolaDynamic, PARADE_SURFACE_FRICTION );
+			const b2Vec2* top = run->surfacePoints;
+			b2Vec2 tangent = b2Normalize( b2Sub( top[1], top[0] ) );
+			AddParadePlayers( run, b2Lerp( top[0], top[1], 0.5f ), tangent );
+			SetFlatFrame( run, 0.0f, 0.5f, arcLength, 0.25f );
+			run->localFrame = ParadeParabolaFrame;
+		}
+		break;
+
+		case parade_slopeTiles:
+		case parade_slopeChain:
+		{
+			BuildSlope( run, run->params.variant == parade_slopeTiles, PARADE_SURFACE_FRICTION );
+			b2Vec2 down = { cosf( SLOPE_ANGLE ), -sinf( SLOPE_ANGLE ) };
+			AddParadePlayers( run, down, down );
+			run->origin = b2Vec2_zero;
+			run->tangent = down;
+			run->normal = b2LeftPerp( down );
+			run->restHeight = 0.0f;
+			run->measureStart = 1.5f;
+			run->pathLength = 26.0f;
+			run->fallDepth = 0.25f;
+		}
+		break;
+
+		default:
+		{
+			if ( run->params.variant == parade_crateFloor )
+			{
+				BuildCrateFloor( run, true, PARADE_SURFACE_FRICTION );
+			}
+			else
+			{
+				b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
+				BuildFlatFloor( groundId, floor_chain, -2.0f, 20, 2.0f, 0.0f, 0.0f, PARADE_SURFACE_FRICTION );
+			}
+			AddParadePlayers( run, b2Vec2_zero, (b2Vec2){ 1.0f, 0.0f } );
+			SetFlatFrame( run, 0.0f, 0.5f, 30.0f, 0.25f );
+		}
+		break;
+	}
 }
 
 // clang-format off
@@ -1975,6 +2360,16 @@ const GhostScenario g_ghostScenarios[] = {
 		600, CreateParabolaCrates, NULL,
 		0, 0, false,
 	},
+	{
+		"Shape Parade",
+		"Circle, capsule, triangle, pentagon, hexagon and box, launched 0.5 s apart over the same surface and measured separately at their lowest point (gap, kick). Compare with the smooth chain variants",
+		"unused",
+		{ "parabola crates (dynamic)", "parabola crates (static)", "parabola smooth chain", "slope triangle tiles", "slope smooth chain", "dynamic crate floor", "flat smooth chain" }, 7,
+		GHOST_MITIGATIONS_BASIC, 6.0f, 1.0f, 0.0f,
+		ghostSweep_speed, { 3.0f, 6.0f, 10.0f }, 3,
+		900, CreateShapeParade, StepShapeParade,
+		3, 0, false, ShapeParadeReference,
+	},
 };
 // clang-format on
 
@@ -2019,6 +2414,12 @@ void GhostRun_Create( GhostRun* run, b2WorldId worldId, int scenarioIndex, Ghost
 
 	g_ghostScenarios[scenarioIndex].create( run );
 
+	if ( run->playerCount > 0 )
+	{
+		// Players are tracked from their launch, see GhostRun_PreStep
+		return;
+	}
+
 	b2Vec2 v = b2Body_GetLinearVelocity( run->playerId );
 	if ( run->localFrame != NULL )
 	{
@@ -2036,6 +2437,102 @@ void GhostRun_Create( GhostRun* run, b2WorldId worldId, int scenarioIndex, Ghost
 	}
 }
 
+void GhostRun_Destroy( GhostRun* run )
+{
+	// Player 0 uses the embedded context
+	for ( int i = 1; i < run->playerCount; ++i )
+	{
+		free( run->players[i].topo );
+		run->players[i].topo = NULL;
+	}
+}
+
+// Measurement frame at the player's center: tangent, normal, progress and the expected speed
+typedef struct PlayerFrame
+{
+	b2Vec2 tangent;
+	b2Vec2 normal;
+	float progress;
+	float expected;
+} PlayerFrame;
+
+static PlayerFrame GetPlayerFrame( GhostRun* run, int index, b2Vec2 center )
+{
+	PlayerFrame f;
+	if ( run->localFrame != NULL )
+	{
+		run->framePlayer = index;
+		GhostLocalFrame frame = run->localFrame( run, center );
+		f.tangent = frame.tangent;
+		f.normal = frame.normal;
+		f.progress = frame.progress;
+		f.expected = frame.expectedSpeed > 0.0f ? frame.expectedSpeed : run->params.speed;
+	}
+	else
+	{
+		f.tangent = run->tangent;
+		f.normal = run->normal;
+		f.progress = b2Dot( b2Sub( center, run->origin ), run->tangent );
+		f.expected = run->params.speed;
+	}
+	return f;
+}
+
+// Drive the sliding parade players along the local surface tangent with the force that cancels
+// their sliding friction under the gravity load at the local surface (see GhostPlayer::driveForce)
+static void StepShapeParade( GhostRun* run )
+{
+	b2Vec2 gravity = b2MulSV( run->params.gravityScale, b2World_GetGravity( run->worldId ) );
+	float g = b2Length( gravity );
+	b2Vec2 up = b2MulSV( -1.0f / g, gravity );
+	for ( int i = 0; i < run->playerCount; ++i )
+	{
+		GhostPlayer* player = run->players + i;
+		if ( player->driveForce == 0.0f || player->launched == false || player->metrics.finished )
+		{
+			continue;
+		}
+
+		// Normal load per unit weight: gravity plus the centripetal load on the parabola
+		b2Vec2 p = ToVec2( b2Body_GetPosition( player->bodyId ) );
+		PlayerFrame f = GetPlayerFrame( run, i, p );
+		float load = b2Dot( f.normal, up );
+		if ( run->localFrame == ParadeParabolaFrame )
+		{
+			float vt = b2Dot( b2Body_GetLinearVelocity( player->bodyId ), f.tangent );
+			load += vt * vt * ParabolaCurvature( p.x ) / g;
+		}
+		load = b2MaxFloat( load, 0.0f );
+		b2Body_ApplyForceToCenter( player->bodyId, b2MulSV( player->driveForce * load, f.tangent ), true );
+	}
+}
+
+// Enable a multi-body player and start tracking it
+static void LaunchPlayer( GhostRun* run, int index )
+{
+	GhostPlayer* player = run->players + index;
+	if ( b2Body_IsEnabled( player->bodyId ) == false )
+	{
+		b2Body_Enable( player->bodyId );
+	}
+	b2Body_SetLinearVelocity( player->bodyId, player->launchVelocity );
+	b2Body_SetAngularVelocity( player->bodyId, player->launchAngularVelocity );
+	player->launched = true;
+
+	GhostMetrics* m = &player->metrics;
+	*m = (GhostMetrics){ 0 };
+	m->minSpeedRatio = FLT_MAX;
+
+	PlayerFrame f = GetPlayerFrame( run, index, player->launchPosition );
+	player->lastTangentSpeed =
+		f.expected > 0.0f ? b2Dot( player->launchVelocity, f.tangent ) * run->params.speed / f.expected : 0.0f;
+	if ( run->localFrame != NULL )
+	{
+		// Progress is absolute along the frame path, so the ideal starts where the player does
+		m->idealProgress = f.progress;
+	}
+}
+
 void GhostRun_PreStep( GhostRun* run )
 {
 	run->time = run->metrics.steps * GHOST_TIME_STEP;
@@ -2044,6 +2541,26 @@ void GhostRun_PreStep( GhostRun* run )
 	if ( scenario->step != NULL )
 	{
 		scenario->step( run );
+	}
+
+	if ( run->playerCount > 0 )
+	{
+		for ( int i = 0; i < run->playerCount; ++i )
+		{
+			GhostPlayer* player = run->players + i;
+			if ( player->launched == false && run->stepCount >= player->launchStep )
+			{
+				LaunchPlayer( run, i );
+			}
+
+			// Finished players are disabled
+			bool active = player->launched && player->metrics.finished == false;
+			if ( active && run->params.mitigation == ghostMitigation_topological )
+			{
+				TopoGhost_PreStep( player->topo );
+			}
+		}
+		return;
 	}
 
 	if ( run->params.mitigation == ghostMitigation_topological )
@@ -2088,8 +2605,125 @@ GhostLocalFrame GhostPolylineFrame( const GhostRun* run, b2Vec2 position )
 	return frame;
 }
 
+// Same rules as the single player update, measured at the player's support point (see GhostRun::players)
+static void UpdatePlayer( GhostRun* run, int index )
+{
+	GhostPlayer* player = run->players + index;
+	GhostMetrics* m = &player->metrics;
+	if ( player->launched == false || m->finished )
+	{
+		return;
+	}
+
+	b2Transform xf = { ToVec2( b2Body_GetPosition( player->bodyId ) ), b2Body_GetRotation( player->bodyId ) };
+	b2Vec2 v = b2Body_GetLinearVelocity( player->bodyId );
+	PlayerFrame f = GetPlayerFrame( run, index, xf.p );
+
+	// Gap and normal velocity of the lowest point of the shape
+	b2Vec2 support = ShapeSupportPoint( player->shapeId, xf, b2Neg( f.normal ) );
+	float h;
+	if ( run->localFrame != NULL )
+	{
+		h = run->localFrame( run, support ).height;
+		m->idealProgress += f.expected * GHOST_TIME_STEP;
+	}
+	else
+	{
+		h = b2Dot( b2Sub( support, run->origin ), f.normal );
+		m->idealProgress = run->params.speed * GHOST_TIME_STEP * ( m->steps + 1 );
+	}
+	// Kick: both the center and the lowest point move away from the surface. The lowest point alone
+	// rises when a face rocks across a polyline vertex, the center alone when a polygon tumbles.
+	float vn = b2MinFloat( b2Dot( v, f.normal ),
+						   b2Dot( b2Body_GetWorldPointVelocity( player->bodyId, ToPos( support ) ), f.normal ) );
+	float vt = f.expected > 0.0f ? b2Dot( v, f.tangent ) * run->params.speed / f.expected : 0.0f;
+	float s = f.progress;
+
+	if ( run->params.mitigation == ghostMitigation_topological )
+	{
+		m->rejectedCount = player->topo->stats.culled + player->topo->stats.vetoed;
+	}
+
+	m->steps += 1;
+	m->progress = s;
+
+	if ( s >= run->measureStart )
+	{
+		m->maxHop = b2MaxFloat( m->maxHop, h );
+		m->maxSink = b2MaxFloat( m->maxSink, -h );
+		m->maxKick = b2MaxFloat( m->maxKick, vn );
+
+		if ( run->params.speed > 0.0f )
+		{
+			m->minSpeedRatio = b2MinFloat( m->minSpeedRatio, vt / run->params.speed );
+		}
+
+		if ( player->lastTangentSpeed > 0.5f && player->lastTangentSpeed - vt > 0.1f * player->lastTangentSpeed )
+		{
+			m->snagCount += 1;
+		}
+
+		if ( -h > run->fallDepth )
+		{
+			m->fellThrough = true;
+		}
+	}
+
+	if ( s >= run->pathLength )
+	{
+		m->finished = true;
+
+		// Keep it from rolling back into the path of later players or disturbing dynamic surfaces
+		b2Body_Disable( player->bodyId );
+	}
+
+	player->lastTangentSpeed = vt;
+}
+
+// Worst player, see GhostRun::metrics
+static void AggregatePlayers( GhostRun* run )
+{
+	GhostMetrics a = { 0 };
+	a.steps = run->stepCount;
+	a.minSpeedRatio = FLT_MAX;
+	a.finished = true;
+	float worstTime = FLT_MAX;
+	for ( int i = 0; i < run->playerCount; ++i )
+	{
+		const GhostPlayer* player = run->players + i;
+		const GhostMetrics* m = &player->metrics;
+		a.snagCount += m->snagCount;
+		a.rejectedCount += m->rejectedCount;
+		a.minSpeedRatio = b2MinFloat( a.minSpeedRatio, m->minSpeedRatio );
+		a.maxHop = b2MaxFloat( a.maxHop, m->maxHop );
+		a.maxSink = b2MaxFloat( a.maxSink, m->maxSink );
+		a.maxKick = b2MaxFloat( a.maxKick, m->maxKick );
+		a.finished = a.finished && m->finished;
+		a.fellThrough = a.fellThrough || m->fellThrough;
+
+		if ( player->launched && m->idealProgress > 0.0f && m->progress / m->idealProgress < worstTime )
+		{
+			worstTime = m->progress / m->idealProgress;
+			a.progress = m->progress;
+			a.idealProgress = m->idealProgress;
+		}
+	}
+	run->metrics = a;
+}
+
 void GhostRun_Update( GhostRun* run )
 {
+	if ( run->playerCount > 0 )
+	{
+		run->stepCount += 1;
+		for ( int i = 0; i < run->playerCount; ++i )
+		{
+			UpdatePlayer( run, i );
+		}
+		AggregatePlayers( run );
+		return;
+	}
+
 	GhostMetrics* m = &run->metrics;
 	b2Vec2 p = b2Sub( ToVec2( b2Body_GetPosition( run->playerId ) ), run->origin );
 	b2Vec2 v = b2Body_GetLinearVelocity( run->playerId );
