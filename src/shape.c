@@ -161,6 +161,11 @@ static b2Shape* b2CreateShapeInternal( b2World* world, b2Body* body, b2WorldTran
 	shape->enableCustomFiltering = def->enableCustomFiltering;
 	shape->enableHitEvents = def->enableHitEvents;
 	shape->enablePreSolveEvents = def->enablePreSolveEvents;
+	// Custom ghost vertices. Shape slots are recycled without zeroing, so reset explicitly.
+	shape->customGhostVertex1 = b2Vec2_zero;
+	shape->customGhostVertex2 = b2Vec2_zero;
+	shape->hasCustomGhostVertex1 = false;
+	shape->hasCustomGhostVertex2 = false;
 	shape->proxyKey = B2_NULL_INDEX;
 	shape->localCentroid = b2GetShapeCentroid( shape );
 	shape->aabbMargin = b2ComputeShapeMargin( shape );
@@ -1727,6 +1732,108 @@ void b2Shape_SetChainSegment( b2ShapeId shapeId, const b2ChainSegment* chainSegm
 
 	bool destroyProxy = true;
 	b2ResetProxy( world, shape, destroyProxy );
+}
+
+// Custom (ghostbusters) ghost vertex API
+
+b2ShapeId b2CustomCreateChainSegmentShape( b2BodyId bodyId, const b2ShapeDef* def, const b2Segment* segment )
+{
+	b2ChainSegment chainSegment;
+	chainSegment.ghost1 = segment->point1;
+	chainSegment.segment = *segment;
+	chainSegment.ghost2 = segment->point2;
+	chainSegment.chainId = B2_NULL_INDEX;
+
+	return b2CreateChainSegmentShape( bodyId, def, &chainSegment );
+}
+
+static b2Shape* b2GetCustomChainSegment( b2ShapeId shapeId )
+{
+	b2World* world = b2GetWorldLocked( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return NULL;
+	}
+
+	b2Shape* shape = b2GetShape( world, shapeId );
+	B2_ASSERT( shape->type == b2_chainSegmentShape );
+	if ( shape->type != b2_chainSegmentShape )
+	{
+		return NULL;
+	}
+
+	return shape;
+}
+
+void b2CustomChainSegment_SetGhostVertices( b2ShapeId shapeId, b2Vec2 ghost1, b2Vec2 ghost2 )
+{
+	B2_CHECK_INPUT( b2IsValidVec2( ghost1 ) && b2IsValidVec2( ghost2 ) );
+
+	b2Shape* shape = b2GetCustomChainSegment( shapeId );
+	if ( shape == NULL )
+	{
+		return;
+	}
+
+	shape->chainSegment.ghost1 = ghost1;
+	shape->chainSegment.ghost2 = ghost2;
+}
+
+void b2CustomChainSegment_SetGhostVertex1( b2ShapeId shapeId, b2Vec2 ghost1 )
+{
+	B2_CHECK_INPUT( b2IsValidVec2( ghost1 ) );
+
+	b2Shape* shape = b2GetCustomChainSegment( shapeId );
+	if ( shape == NULL )
+	{
+		return;
+	}
+
+	shape->chainSegment.ghost1 = ghost1;
+}
+
+void b2CustomChainSegment_SetGhostVertex2( b2ShapeId shapeId, b2Vec2 ghost2 )
+{
+	B2_CHECK_INPUT( b2IsValidVec2( ghost2 ) );
+
+	b2Shape* shape = b2GetCustomChainSegment( shapeId );
+	if ( shape == NULL )
+	{
+		return;
+	}
+
+	shape->chainSegment.ghost2 = ghost2;
+}
+
+void b2CustomShape_SetGhostVertices( b2ShapeId shapeId, b2Vec2 ghost1, b2Vec2 ghost2 )
+{
+	B2_CHECK_INPUT( b2IsValidVec2( ghost1 ) && b2IsValidVec2( ghost2 ) );
+
+	b2World* world = b2GetWorldLocked( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b2Shape* shape = b2GetShape( world, shapeId );
+	B2_ASSERT( shape->type == b2_segmentShape );
+	shape->customGhostVertex1 = ghost1;
+	shape->customGhostVertex2 = ghost2;
+	shape->hasCustomGhostVertex1 = true;
+	shape->hasCustomGhostVertex2 = true;
+}
+
+void b2CustomShape_ClearGhostVertices( b2ShapeId shapeId )
+{
+	b2World* world = b2GetWorldLocked( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b2Shape* shape = b2GetShape( world, shapeId );
+	shape->hasCustomGhostVertex1 = false;
+	shape->hasCustomGhostVertex2 = false;
 }
 
 b2ChainId b2Shape_GetParentChain( b2ShapeId shapeId )

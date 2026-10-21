@@ -870,6 +870,44 @@ B2_API void b2Shape_SetPolygon( b2ShapeId shapeId, const b2Polygon* polygon );
 /// segment owned by a chain shape (chainId != B2_NULL_INDEX).
 B2_API void b2Shape_SetChainSegment( b2ShapeId shapeId, const b2ChainSegment* chainSegment );
 
+// ---------------------------------------------------------------------------------------------
+// Custom (ghostbusters) ghost vertex API. These are not part of upstream Box2D. They are prefixed
+// with b2Custom to distinguish them from the official b2CreateChainSegmentShape and
+// b2Shape_SetChainSegment. The setters below mutate ghost vertices in place without resetting
+// the broad-phase proxy (existing contacts are kept) and are not captured by world recording.
+// ---------------------------------------------------------------------------------------------
+
+/// Create a loose chain segment shape from a plain segment. Ghost vertices are initialized to the
+/// segment endpoints. Use b2CustomChainSegment_SetGhostVertices to configure the ghost vertices.
+/// Wraps the official b2CreateChainSegmentShape.
+/// @return the shape id, or b2_nullShapeId if the segment is too short.
+B2_API b2ShapeId b2CustomCreateChainSegmentShape( b2BodyId bodyId, const b2ShapeDef* def,
+												  const b2Segment* segment );
+
+/// Set the ghost vertices for a chain segment shape.
+/// ghost1 is the vertex before the segment start (i.e. start of the previous segment).
+/// ghost2 is the vertex after the segment end (i.e. end of the next segment).
+B2_API void b2CustomChainSegment_SetGhostVertices( b2ShapeId shapeId, b2Vec2 ghost1, b2Vec2 ghost2 );
+
+/// Set ghost vertex 1 for a chain segment shape.
+B2_API void b2CustomChainSegment_SetGhostVertex1( b2ShapeId shapeId, b2Vec2 ghost1 );
+
+/// Set ghost vertex 2 for a chain segment shape.
+B2_API void b2CustomChainSegment_SetGhostVertex2( b2ShapeId shapeId, b2Vec2 ghost2 );
+
+/// Set ghost vertices on a plain segment shape so that its collision is routed through the
+/// chain-segment path. This suppresses ghost collisions at junctions between adjacent unchained
+/// segment shapes (the same Voronoi-clamping logic used by b2ChainShape) while the shape remains
+/// a b2_segmentShape.
+/// - ghost1: the point *before* segment.point1 (the previous tile's far endpoint)
+/// - ghost2: the point *after*  segment.point2 (the next tile's far endpoint)
+/// Only meaningful for shapes of type b2_segmentShape.
+B2_API void b2CustomShape_SetGhostVertices( b2ShapeId shapeId, b2Vec2 ghost1, b2Vec2 ghost2 );
+
+/// Clear ghost vertices previously set by b2CustomShape_SetGhostVertices.
+/// The segment will revert to plain two-sided segment collision.
+B2_API void b2CustomShape_ClearGhostVertices( b2ShapeId shapeId );
+
 /// Get the parent chain id if the shape type is a chain segment, otherwise returns b2_nullChainId.
 B2_API b2ChainId b2Shape_GetParentChain( b2ShapeId shapeId );
 

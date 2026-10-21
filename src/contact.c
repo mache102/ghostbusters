@@ -133,16 +133,44 @@ static b2LocalManifold b2PolygonManifold( const b2Shape* shapeA, const b2Shape* 
 	return b2CollidePolygons( &shapeA->polygon, &shapeB->polygon, xf );
 }
 
+// Custom: build a synthetic b2ChainSegment from a b2_segmentShape that has custom ghost vertices.
+// ghost1/ghost2 fall back to the segment's own endpoints when not set, which
+// collapses the Voronoi region on that side (safe: behaves like a plain segment).
+static bool b2HasCustomGhostVertices( const b2Shape* shape )
+{
+	return shape->hasCustomGhostVertex1 || shape->hasCustomGhostVertex2;
+}
+
+static b2ChainSegment b2MakeCustomGhostChainSegment( const b2Shape* shape )
+{
+	b2ChainSegment cs;
+	cs.segment = shape->segment;
+	cs.ghost1 = shape->hasCustomGhostVertex1 ? shape->customGhostVertex1 : shape->segment.point1;
+	cs.ghost2 = shape->hasCustomGhostVertex2 ? shape->customGhostVertex2 : shape->segment.point2;
+	cs.chainId = B2_NULL_INDEX;
+	return cs;
+}
+
 static b2LocalManifold b2SegmentAndCircleManifold( const b2Shape* shapeA, const b2Shape* shapeB, b2Transform xf,
 												   b2SimplexCache* cache )
 {
 	B2_UNUSED( cache );
+	if ( b2HasCustomGhostVertices( shapeA ) )
+	{
+		b2ChainSegment cs = b2MakeCustomGhostChainSegment( shapeA );
+		return b2CollideChainSegmentAndCircle( &cs, &shapeB->circle, xf );
+	}
 	return b2CollideSegmentAndCircle( &shapeA->segment, &shapeB->circle, xf );
 }
 
 static b2LocalManifold b2SegmentAndCapsuleManifold( const b2Shape* shapeA, const b2Shape* shapeB, b2Transform xf,
 													b2SimplexCache* cache )
 {
+	if ( b2HasCustomGhostVertices( shapeA ) )
+	{
+		b2ChainSegment cs = b2MakeCustomGhostChainSegment( shapeA );
+		return b2CollideChainSegmentAndCapsule( &cs, &shapeB->capsule, xf, cache );
+	}
 	B2_UNUSED( cache );
 	return b2CollideSegmentAndCapsule( &shapeA->segment, &shapeB->capsule, xf );
 }
@@ -150,6 +178,11 @@ static b2LocalManifold b2SegmentAndCapsuleManifold( const b2Shape* shapeA, const
 static b2LocalManifold b2SegmentAndPolygonManifold( const b2Shape* shapeA, const b2Shape* shapeB, b2Transform xf,
 													b2SimplexCache* cache )
 {
+	if ( b2HasCustomGhostVertices( shapeA ) )
+	{
+		b2ChainSegment cs = b2MakeCustomGhostChainSegment( shapeA );
+		return b2CollideChainSegmentAndPolygon( &cs, &shapeB->polygon, xf, cache );
+	}
 	B2_UNUSED( cache );
 	return b2CollideSegmentAndPolygon( &shapeA->segment, &shapeB->polygon, xf );
 }

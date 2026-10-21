@@ -33,6 +33,7 @@ extern int ContainerTest( void );
 extern int DeterminismTest( void );
 extern int DistanceTest( void );
 extern int DynamicTreeTest( void );
+extern int GhostbustersTest( void );
 extern int IdTest( void );
 extern int InvalidInputTest( void );
 extern int LargeWorldTest( void );
@@ -112,6 +113,7 @@ int main( int argc, char** argv )
 	MAYBE_RUN_TEST( DeterminismTest );
 	MAYBE_RUN_TEST( DistanceTest );
 	MAYBE_RUN_TEST( DynamicTreeTest );
+	MAYBE_RUN_TEST( GhostbustersTest );
 	MAYBE_RUN_TEST( IdTest );
 	MAYBE_RUN_TEST( InvalidInputTest );
 	MAYBE_RUN_TEST( LargeWorldTest );

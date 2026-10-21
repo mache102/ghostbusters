@@ -37,6 +37,14 @@ typedef struct b2Shape
 		b2ChainSegment chainSegment;
 	};
 
+	// Custom: ghost vertices for b2_segmentShape only.
+	// When set, segment collision dispatches through the chain-segment path,
+	// which uses Voronoi clamping to suppress ghost collisions at junctions.
+	b2Vec2 customGhostVertex1; // point before segment.point1
+	b2Vec2 customGhostVertex2; // point after  segment.point2
+	bool hasCustomGhostVertex1;
+	bool hasCustomGhostVertex2;
+
 	uint16_t generation;
 	bool enableSensorEvents;
 	bool enableContactEvents;

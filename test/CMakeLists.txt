@@ -9,6 +9,7 @@ set(BOX2D_TEST_FILES
     test_determinism.c
     test_distance.c
     test_dynamic_tree.c
+    test_ghostbusters.c
     test_id.c
     test_invalid_input.c
     test_large_world.c
