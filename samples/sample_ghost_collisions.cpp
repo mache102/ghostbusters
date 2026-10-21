@@ -107,6 +107,11 @@ public:
 		{
 			changed |= ImGui::InputFloat( scenario.knobName, &s_params.knob, 0.0f, 0.0f, "%.4f" );
 		}
+		if ( s_params.mitigation == ghostMitigation_rounded )
+		{
+			// Convex radius as a fraction of the polygon width
+			changed |= ImGui::SliderFloat( "Roundness", &s_params.roundness, 0.0f, 0.3f, "%.2f" );
+		}
 		ImGui::PopItemWidth();
 
 		ImGui::Checkbox( "Follow", &s_follow );

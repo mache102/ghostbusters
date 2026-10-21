@@ -270,6 +270,64 @@ static bool MultiPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos po
 	return SemrauPreContinuous( player->bodyId, &player->metrics.rejectedCount, shapeIdA, shapeIdB, normal );
 }
 
+// Mitigations that install pre-solve / pre-continuous callbacks on the player
+static bool UsesCallbacks( GhostMitigation mitigation )
+{
+	return mitigation != ghostMitigation_none && mitigation != ghostMitigation_rounded;
+}
+
+b2Polygon GhostRoundPolygon( const b2Polygon* polygon, float roundness )
+{
+	if ( roundness <= 0.0f )
+	{
+		return *polygon;
+	}
+
+	// Width: the minimum extent of the polygon across its face normals (caliper width). Rounding
+	// relative to the thinnest dimension keeps the core valid for roundness < 1/2 (boxes, regular
+	// polygons: every face shrinks to a point at r = inradius >= width / 3).
+	int count = polygon->count;
+	float width = FLT_MAX;
+	for ( int i = 0; i < count; ++i )
+	{
+		b2Vec2 n = polygon->normals[i];
+		float face = b2Dot( n, polygon->vertices[i] );
+		float lowest = face;
+		for ( int j = 0; j < count; ++j )
+		{
+			lowest = b2MinFloat( lowest, b2Dot( n, polygon->vertices[j] ) );
+		}
+		width = b2MinFloat( width, face - lowest + 2.0f * polygon->radius );
+	}
+	float r = roundness * width;
+
+	// Erode: move every face plane inward by r. Vertex i is shared by faces i - 1 and i; the
+	// offset planes meet at v - r * ( na + nb ) / ( 1 + na . nb ).
+	b2Vec2 points[B2_MAX_POLYGON_VERTICES];
+	for ( int i = 0; i < count; ++i )
+	{
+		b2Vec2 na = polygon->normals[i == 0 ? count - 1 : i - 1];
+		b2Vec2 nb = polygon->normals[i];
+		float scale = r / ( 1.0f + b2Dot( na, nb ) );
+		points[i] = b2MulSub( polygon->vertices[i], scale, b2Add( na, nb ) );
+	}
+
+	// Dilate by the convex radius: faces back in place, corners become radius r arcs
+	b2Hull hull = b2ComputeHull( points, count );
+	B2_ASSERT( hull.count == count );
+	return b2MakePolygon( &hull, polygon->radius + r );
+}
+
+// The polygon a player shape is built with under the run's mitigation
+static b2Polygon PlayerPolygon( const GhostRun* run, const b2Polygon* polygon )
+{
+	if ( run->params.mitigation != ghostMitigation_rounded )
+	{
+		return *polygon;
+	}
+	return GhostRoundPolygon( polygon, run->params.roundness );
+}
+
 typedef struct PlayerDef
 {
 	b2Vec2 position;
@@ -316,7 +374,7 @@ static b2BodyId CreatePlayerBody( GhostRun* run, const PlayerDef* def, b2ShapeDe
 		shapeDef->enablePreSolveEvents = true;
 		b2World_SetPreSolveCallback( run->worldId, TopoGhostPreSolve, TopoGhostPreContinuous, &run->topo );
 	}
-	else if ( run->params.mitigation != ghostMitigation_none )
+	else if ( UsesCallbacks( run->params.mitigation ) )
 	{
 		// Pre-solve must see a fresh manifold at every tile boundary, unless we are testing the default
 		bodyDef.enableContactRecycling = run->params.mitigation == ghostMitigation_semrauRecycling;
@@ -333,7 +391,8 @@ static void CreatePlayerPolygon( GhostRun* run, const PlayerDef* def, const b2Po
 {
 	b2ShapeDef shapeDef;
 	b2BodyId bodyId = CreatePlayerBody( run, def, &shapeDef );
-	run->playerShapeId = b2CreatePolygonShape( bodyId, &shapeDef, polygon );
+	b2Polygon shape = PlayerPolygon( run, polygon );
+	run->playerShapeId = b2CreatePolygonShape( bodyId, &shapeDef, &shape );
 }
 
 static void CreatePlayerCircle( GhostRun* run, const PlayerDef* def, float radius )
@@ -405,6 +464,19 @@ static void CreateTiltedBox( GhostRun* run )
 	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, restHeight } );
 	b2Polygon box = b2MakeOffsetBox( h, h, b2Vec2_zero, q );
 	CreatePlayerPolygon( run, &def, &box );
+
+	if ( run->params.mitigation == ghostMitigation_rounded )
+	{
+		// The rounded lowest corner sits lower: rest on the rounded shape's support point
+		b2Polygon shape = b2Shape_GetPolygon( run->playerShapeId );
+		float lowest = shape.vertices[0].y;
+		for ( int i = 1; i < shape.count; ++i )
+		{
+			lowest = b2MinFloat( lowest, shape.vertices[i].y );
+		}
+		restHeight = shape.radius - lowest;
+		b2Body_SetTransform( run->playerId, ToPos( (b2Vec2){ 0.0f, restHeight } ), b2Rot_identity );
+	}
 	SetFlatFrame( run, restHeight, 0.5f, 40.0f, 0.5f );
 }
 
@@ -791,6 +863,8 @@ static void CreateCompoundPlayer( GhostRun* run )
 	b2BodyId bodyId = CreatePlayerBody( run, &def, &shapeDef );
 	b2Polygon left = b2MakeOffsetBox( 0.5f, 0.5f, (b2Vec2){ -0.5f, 0.0f }, b2Rot_identity );
 	b2Polygon right = b2MakeOffsetBox( 0.5f, 0.5f, (b2Vec2){ 0.5f, 0.0f }, b2Rot_identity );
+	left = PlayerPolygon( run, &left );
+	right = PlayerPolygon( run, &right );
 	run->playerShapeId = b2CreatePolygonShape( bodyId, &shapeDef, &right );
 	b2CreatePolygonShape( bodyId, &shapeDef, &left );
 	SetFlatFrame( run, 0.5f, 0.5f, 40.0f, 0.5f );
@@ -1124,7 +1198,8 @@ static void CreateVehicleCrest( GhostRun* run )
 	b2BodyId bodyId = CreatePlayerBody( run, &def, &shapeDef );
 	b2Circle rear = { { -1.5f, 0.0f }, radius };
 	b2Circle front = { { 1.5f, 0.0f }, radius };
-	b2Polygon chassis = b2MakeOffsetBox( 2.0f, 0.3f, (b2Vec2){ 0.0f, 0.9f }, b2Rot_identity );
+	b2Polygon chassisBox = b2MakeOffsetBox( 2.0f, 0.3f, (b2Vec2){ 0.0f, 0.9f }, b2Rot_identity );
+	b2Polygon chassis = PlayerPolygon( run, &chassisBox );
 	run->playerShapeId = b2CreateCircleShape( bodyId, &shapeDef, &front );
 	b2CreateCircleShape( bodyId, &shapeDef, &rear );
 	shapeDef.density = 0.2f;
@@ -1459,7 +1534,7 @@ static void AddParadePlayer( GhostRun* run, const char* label, b2ShapeType type,
 	// The circle starts rolling, the others start sliding (they may still tip over and tumble)
 	player->launchAngularVelocity = type == b2_circleShape ? -run->params.speed / restHeight : 0.0f;
 
-	bool mitigated = run->params.mitigation != ghostMitigation_none;
+	bool mitigated = UsesCallbacks( run->params.mitigation );
 	b2BodyDef bodyDef = b2DefaultBodyDef();
 	bodyDef.type = b2_dynamicBody;
 	bodyDef.position = ToPos( player->launchPosition );
@@ -1490,8 +1565,11 @@ static void AddParadePlayer( GhostRun* run, const char* label, b2ShapeType type,
 			player->shapeId = b2CreateCapsuleShape( player->bodyId, &shapeDef, geometry );
 			break;
 		default:
-			player->shapeId = b2CreatePolygonShape( player->bodyId, &shapeDef, geometry );
-			break;
+		{
+			b2Polygon polygon = PlayerPolygon( run, geometry );
+			player->shapeId = b2CreatePolygonShape( player->bodyId, &shapeDef, &polygon );
+		}
+		break;
 	}
 
 	float mass = b2Body_GetMass( player->bodyId );
@@ -1547,7 +1625,7 @@ static void AddParadePlayers( GhostRun* run, b2Vec2 surfacePoint, b2Vec2 tangent
 	b2Polygon box = b2MakeBox( 0.25f, 0.25f );
 	AddParadePlayer( run, "box", b2_polygonShape, &box, 0.25f, surfacePoint, tangent );
 
-	if ( run->params.mitigation != ghostMitigation_none )
+	if ( UsesCallbacks( run->params.mitigation ) )
 	{
 		b2World_SetPreSolveCallback( run->worldId, MultiPreSolve, MultiPreContinuous, run );
 	}
@@ -1899,7 +1977,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Locked box sliding over a seamed floor; gravity scale loads the contact (C1, C2, C10)",
 		"unused",
 		{ "box tiles", "segment tiles", "custom ghost segments", "chain" }, 4,
-		GHOST_MITIGATIONS_ALL, 10.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_ALL | GHOST_ROUNDED, 10.0f, 1.0f, 0.0f,
 		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f, 100.0f }, 4,
 		300, CreateSlidingBox, NULL,
 		1, 0, false,
@@ -1909,7 +1987,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Odd tiles raised by a small step (knob, meters) (C11)",
 		"step height",
 		{ "box tiles", "custom ghost segments", "loose chain segments" }, 3,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.001f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.001f,
 		ghostSweep_knob, { 0.001f, 0.005f, 0.015f, 0.03f }, 4,
 		300, CreateMisalignedTiles, NULL,
 	},
@@ -1918,7 +1996,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Locked box tilted by knob degrees, sliding on one corner: point-face contacts (C4)",
 		"tilt (deg)",
 		{ "box tiles", "chain" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 10.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 10.0f,
 		ghostSweep_knob, { 2.0f, 10.0f, 30.0f }, 3,
 		300, CreateTiltedBox, NULL,
 	},
@@ -1927,7 +2005,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Thin plank under heavy forced gravity: deep penetration (C6)",
 		"unused",
 		{ "chain", "box tiles", "custom ghost segments" }, 3,
-		GHOST_MITIGATIONS_BASIC, 5.0f, 2000.0f, 0.0f,
+		GHOST_MITIGATIONS_BASIC | GHOST_ROUNDED, 5.0f, 2000.0f, 0.0f,
 		ghostSweep_gravityScale, { 1000.0f, 2000.0f, 3000.0f, 4000.0f, 5000.0f }, 5,
 		300, CreateThinPlank, NULL,
 		1, 0, false,
@@ -1937,7 +2015,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Fast diagonal landing onto 0.5 m tiles: CCD time loss (C7)",
 		"unused",
 		{ "chain", "box tiles", "single segment" }, 3,
-		GHOST_MITIGATIONS_SEMRAU, 40.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 40.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 20.0f, 40.0f, 80.0f }, 3,
 		240, CreateFastLanding, NULL,
 		1, 0, false,
@@ -1965,7 +2043,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Platformer: 3 flush kinematic tiles sliding back and forth in gaps (knob = platform speed)",
 		"platform speed",
 		{ "box tiles terrain", "chain terrain", "ball, box tiles terrain", "ball, chain terrain" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 1.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 1.0f,
 		ghostSweep_knob, { 0.0f, 1.0f, 3.0f }, 3,
 		300, CreateMovingPlatform, StepMovingPlatform,
 	},
@@ -1974,7 +2052,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Platformer: 3 kinematic tiles rocking about their centers (knob = amplitude, degrees)",
 		"amplitude (deg)",
 		{ "box tiles", "chain", "ball, box tiles", "ball, chain" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.5f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.5f,
 		ghostSweep_knob, { 0.0f, 0.5f, 2.0f }, 3,
 		300, CreateRotatingPlatform, StepRotatingPlatform,
 		3, 0, false,
@@ -1984,7 +2062,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Platformer: locked box sliding down a 30 degree slope of triangle tiles vs a polyline",
 		"unused",
 		{ "box, triangle tiles", "box, chain", "ball, triangle tiles", "ball, chain", "free box, triangle tiles", "free box, chain" }, 6,
-		GHOST_MITIGATIONS_SEMRAU, 5.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 5.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 0.0f, 5.0f, 10.0f }, 3,
 		300, CreateSlopeTiles, NULL,
 		4, 0, false,
@@ -1994,7 +2072,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Player body made of two boxes side by side: internal seam on the sliding face",
 		"unused",
 		{ "box tiles", "chain" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.0f,
 		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
 		300, CreateCompoundPlayer, NULL,
 	},
@@ -2012,7 +2090,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Player spawned inside a tile next to a seam (knob = depth): must be pushed up, not through the seam",
 		"depth",
 		{ "circle", "box" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 1.0f, 1.0f, 0.15f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 1.0f, 1.0f, 0.15f,
 		ghostSweep_knob, { 0.05f, 0.15f, 0.3f }, 3,
 		240, CreateInteriorPushOut, NULL,
 	},
@@ -2021,7 +2099,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: 1 m wall at x = 12 on a tiled floor, player held pressing right. Correct: blocked at x = 11.5, never finishes (v4 = segment wall)",
 		"unused",
 		{ "box tiles + wall box", "box tiles + tiled wall", "chain into wall", "thin 0.1 m wall", "segment tiles + segment wall" }, 5,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 10.0f, 40.0f, 80.0f }, 3,
 		180, CreateTileWall, StepPushRight,
 		0, 0x1f, false,
@@ -2031,7 +2109,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: floor ends at x = 10, 3 m deep pit, far wall at x = 14. Correct: ends in the pit, x <= 13.5, y = -3 + half height, never finishes",
 		"unused",
 		{ "box tiles", "chain", "tall box, box tiles", "tall box, chain" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 5.0f, 10.0f, 20.0f }, 3,
 		240, CreateCliffPit, NULL,
 		0, 0xf, false,
@@ -2041,7 +2119,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: box pressed into a tiled vertical wall slides down it (progress = descent). Correct: no snags, sink (into wall) ~0, hop ~0",
 		"unused",
 		{ "box wall tiles", "chain wall", "segment wall tiles" }, 3,
-		GHOST_MITIGATIONS_SEMRAU, 2.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 2.0f, 1.0f, 0.0f,
 		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
 		240, CreateWallSlideDown, StepPushLeft,
 		2, 0, false,
@@ -2051,7 +2129,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: compound vehicle (two wheels + chassis), a free plank or a locked box over a crest onto a 20 deg downslope. Correct: finishes on the lower floor, never fell",
 		"unused",
 		{ "vehicle, chain", "vehicle, box + slope tiles", "plank, chain", "plank, box + slope tiles", "locked box, chain", "locked box, box + slope tiles" }, 6,
-		GHOST_MITIGATIONS_SEMRAU, 8.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 8.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 3.0f, 8.0f, 15.0f }, 3,
 		360, CreateVehicleCrest, NULL,
 		1, 0, false,
@@ -2061,7 +2139,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: floor tiles separated by gaps of knob m. Correct: no snag, no sink",
 		"gap",
 		{ "box tiles", "segment tiles" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.05f,
+		GHOST_MITIGATIONS_SEMRAU | GHOST_ROUNDED, 10.0f, 1.0f, 0.05f,
 		ghostSweep_knob, { 0.01f, 0.05f, 0.2f }, 3,
 		300, CreateSmallGaps, NULL,
 		1, 0, false,
@@ -2071,7 +2149,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"ADV: fast player whose unblocked end pose rests on the back of a thin wall (knob = end pose offset). Correct: blocked at x = 11.5, never finishes",
 		"end offset",
 		{ "thin box wall, box tiles", "segment wall, box tiles", "thin box wall, chain floor", "segment wall, chain floor" }, 4,
-		GHOST_MITIGATIONS_BASIC, 80.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_BASIC | GHOST_ROUNDED, 80.0f, 1.0f, 0.0f,
 		ghostSweep_knob, { -0.015f, 0.0f, 0.015f, 0.05f, 0.3f }, 5,
 		120, CreateCcdBackFace, NULL,
 		0, 0xf, false,
@@ -2091,7 +2169,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Circle, capsule, triangle, pentagon, hexagon and box, launched 0.5 s apart over the same surface and measured separately at their lowest point (gap, kick). Compare with the smooth chain variants",
 		"unused",
 		{ "parabola crates (dynamic)", "parabola crates (static)", "parabola smooth chain", "slope triangle tiles", "slope smooth chain", "dynamic crate floor", "flat smooth chain" }, 7,
-		GHOST_MITIGATIONS_BASIC, 6.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_BASIC | GHOST_ROUNDED, 6.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 3.0f, 6.0f, 10.0f }, 3,
 		900, CreateShapeParade, StepShapeParade,
 		3, 0, false, ShapeParadeReference,
@@ -2101,7 +2179,7 @@ const GhostScenario g_ghostScenarios[] = {
 		"Rolling circle over static slices of a 3x Parabola Crates band whose top is a gentle cosine (hills and valleys). Correct: never leaves the ground (air = airborne steps, lifts = lift-offs)",
 		"unused",
 		{ "static slices", "static slices, separate bodies", "smooth chain", "parade, static slices", "parade, smooth chain" }, 5,
-		GHOST_MITIGATIONS_BASIC, 3.0f, 1.0f, 0.0f,
+		GHOST_MITIGATIONS_BASIC | GHOST_ROUNDED, 3.0f, 1.0f, 0.0f,
 		ghostSweep_speed, { 1.0f, 3.0f, 5.0f }, 3,
 		900, CreateParabolaHills, StepShapeParade,
 		0, 0, false, ParabolaHillsReference, true,
@@ -2123,6 +2201,8 @@ const char* GhostMitigationName( GhostMitigation mitigation )
 			return "semrau + recycling";
 		case ghostMitigation_topological:
 			return "topological";
+		case ghostMitigation_rounded:
+			return "rounded";
 		default:
 			return "?";
 	}
@@ -2137,6 +2217,7 @@ GhostParams GhostDefaultParams( int scenarioIndex )
 	params.speed = scenario->speed;
 	params.gravityScale = scenario->gravityScale;
 	params.knob = scenario->knob;
+	params.roundness = GHOST_DEFAULT_ROUNDNESS;
 	return params;
 }
 

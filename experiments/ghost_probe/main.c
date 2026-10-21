@@ -9,6 +9,15 @@
 //        ghost_probe --trace <scenario> <variant> <mitigation> <sweep value>
 //        ghost_probe --players <scenario> [<variant> <mitigation> <sweep value>]
 //        ghost_probe --bench <scenario> <variant> <repeats>
+//        ghost_probe --round <scenario> <variant> <sweep value>
+//        ghost_probe --roundness <f> <any of the above>
+//        ghost_probe --speed <v> <any of the above>
+//
+// --round compares none / semrau / topological with the rounded polygon mitigation at convex
+// radius fractions ROUND_SWEEP (one row per configuration, per player for multi-body scenarios).
+// --roundness sets the fraction used by every other mode (default GHOST_DEFAULT_ROUNDNESS).
+// --speed overrides the scenario's launch speed (unless the mode sweeps speed), for phase tests:
+// a seam is met at the same point of the step when the tile width is a multiple of speed * dt.
 
 #include "ghost_scenarios.h"
 
@@ -34,6 +43,23 @@ static void SetSweepValue( GhostParams* params, GhostSweepField field, float val
 			params->knob = value;
 			break;
 	}
+}
+
+// Convex radius fraction for ghostMitigation_rounded, see --roundness
+static float s_roundness = GHOST_DEFAULT_ROUNDNESS;
+
+// Launch speed override, see --speed (<= 0: scenario default)
+static float s_speed = 0.0f;
+
+static GhostParams ProbeParams( int scenarioIndex )
+{
+	GhostParams params = GhostDefaultParams( scenarioIndex );
+	params.roundness = s_roundness;
+	if ( s_speed > 0.0f )
+	{
+		params.speed = s_speed;
+	}
+	return params;
 }
 
 static const char* SweepName( const GhostScenario* scenario )
@@ -228,7 +254,7 @@ static void PrintPlayers( const GhostScenario* scenario, int variant, const Ghos
 static void RunPlayers( int si, int variant, int mitigation, float sweepValue )
 {
 	const GhostScenario* scenario = g_ghostScenarios + si;
-	GhostParams params = GhostDefaultParams( si );
+	GhostParams params = ProbeParams( si );
 	params.variant = variant;
 	params.mitigation = (GhostMitigation)mitigation;
 	SetSweepValue( &params, scenario->sweepField, sweepValue );
@@ -294,7 +320,7 @@ static int Trace( const char* name, int variant, int mitigation, float sweepValu
 		return 1;
 	}
 
-	GhostParams params = GhostDefaultParams( si );
+	GhostParams params = ProbeParams( si );
 	params.variant = variant;
 	params.mitigation = (GhostMitigation)mitigation;
 	SetSweepValue( &params, g_ghostScenarios[si].sweepField, sweepValue );
@@ -372,7 +398,7 @@ static int Bench( const char* name, int variant, int repeats )
 		int steps = 0;
 		for ( int r = 0; r < repeats; ++r )
 		{
-			GhostParams params = GhostDefaultParams( si );
+			GhostParams params = ProbeParams( si );
 			params.variant = variant;
 			params.mitigation = mitigations[mi];
 
@@ -491,11 +517,12 @@ static const char* AirborneVerdict( int si, GhostParams params, const GhostMetri
 	return RelativeVerdict( m, &ref );
 }
 
-// Every scenario variant at its default parameters, none vs semrau vs topological
+// Every scenario variant at its default parameters, none vs semrau vs rounded vs topological
 static int Defaults( void )
 {
-	GhostMitigation mitigations[3] = { ghostMitigation_none, ghostMitigation_semrau, ghostMitigation_topological };
-	printf( "| scenario | variant | none | semrau | topological |\n|---|---|---|---|---|\n" );
+	GhostMitigation mitigations[4] = { ghostMitigation_none, ghostMitigation_semrau, ghostMitigation_rounded,
+									   ghostMitigation_topological };
+	printf( "| scenario | variant | none | semrau | rounded | topological |\n|---|---|---|---|---|---|\n" );
 	for ( int si = 0; si < g_ghostScenarioCount; ++si )
 	{
 		const GhostScenario* scenario = g_ghostScenarios + si;
@@ -503,7 +530,7 @@ static int Defaults( void )
 		{
 			// The star marks the variant the sample opens with
 			printf( "| %s | %s%s |", scenario->name, scenario->variantNames[vi], vi == scenario->defaultVariant ? " *" : "" );
-			for ( int mi = 0; mi < 3; ++mi )
+			for ( int mi = 0; mi < 4; ++mi )
 			{
 				if ( ( scenario->mitigationMask & GHOST_MITIGATE( mitigations[mi] ) ) == 0 )
 				{
@@ -511,7 +538,7 @@ static int Defaults( void )
 					continue;
 				}
 
-				GhostParams params = GhostDefaultParams( si );
+				GhostParams params = ProbeParams( si );
 				params.variant = vi;
 				params.mitigation = mitigations[mi];
 				GhostMetrics m = RunOnce( si, params );
@@ -529,8 +556,109 @@ static int Defaults( void )
 	return 0;
 }
 
+#define ROUND_SWEEP_COUNT 6
+static const float s_roundSweep[ROUND_SWEEP_COUNT] = { 0.02f, 0.05f, 0.08f, 0.10f, 0.15f, 0.25f };
+
+// One --round table row: a single player run or one player of a multi-body run
+static void PrintRoundRow( const char* config, const char* label, const char* verdict, const GhostMetrics* m )
+{
+	printf( "| %s | %s | %s | %s | %.3f | %.3f | %d | %.4f | %.4f | %.3f | %d | %d |\n", config, label, verdict,
+			m->finished ? "yes" : "no", m->idealProgress > 0.0f ? m->progress / m->idealProgress : 0.0f,
+			m->minSpeedRatio == FLT_MAX ? 0.0f : m->minSpeedRatio, m->snagCount, m->maxHop, m->maxSink, m->maxKick,
+			m->airborneSteps, m->liftOffCount );
+}
+
+// none, semrau and topological, then rounded at every ROUND_SWEEP fraction, for one configuration
+static int RoundSweep( const char* name, int variant, float sweepValue )
+{
+	int si = FindScenario( name );
+	if ( si < 0 )
+	{
+		printf( "no scenario matching '%s'\n", name );
+		return 1;
+	}
+
+	const GhostScenario* scenario = g_ghostScenarios + si;
+	printf( "#### %s / %s / %s %g\n\n", scenario->name, scenario->variantNames[variant], SweepName( scenario ), sweepValue );
+	printf( "| mitigation | player | verdict | done | time | minV | snags | hop | sink | kick | air | lifts |\n" );
+	printf( "|---|---|---|---|---|---|---|---|---|---|---|---|\n" );
+
+	GhostMitigation fixed[3] = { ghostMitigation_none, ghostMitigation_semrau, ghostMitigation_topological };
+	for ( int ci = 0; ci < 3 + ROUND_SWEEP_COUNT; ++ci )
+	{
+		GhostParams params = ProbeParams( si );
+		params.variant = variant;
+		SetSweepValue( &params, scenario->sweepField, sweepValue );
+		char config[64];
+		if ( ci < 3 )
+		{
+			params.mitigation = fixed[ci];
+			snprintf( config, sizeof( config ), "%s", GhostMitigationName( fixed[ci] ) );
+		}
+		else
+		{
+			params.mitigation = ghostMitigation_rounded;
+			params.roundness = s_roundSweep[ci - 3];
+			snprintf( config, sizeof( config ), "rounded %.2f", params.roundness );
+		}
+
+		if ( ( scenario->mitigationMask & GHOST_MITIGATE( params.mitigation ) ) == 0 )
+		{
+			continue;
+		}
+
+		// The reference run reuses the run storage, so it goes first
+		GhostMetrics reference[GHOST_MAX_PLAYERS];
+		bool hasReference = ReferencePlayers( si, params, reference );
+		const GhostRun* run = Simulate( si, params );
+		if ( run->playerCount == 0 )
+		{
+			GhostMetrics m = run->metrics;
+			const char* verdict =
+				scenario->measureAirborne ? AirborneVerdict( si, params, &m ) : Verdict( scenario, variant, &m );
+			PrintRoundRow( config, "-", verdict, &m );
+			continue;
+		}
+
+		GhostPlayer players[GHOST_MAX_PLAYERS];
+		int playerCount = run->playerCount;
+		memcpy( players, run->players, sizeof( players ) );
+		for ( int i = 0; i < playerCount; ++i )
+		{
+			const char* verdict = hasReference ? RelativeVerdict( &players[i].metrics, reference + i )
+											   : Verdict( scenario, variant, &players[i].metrics );
+			PrintRoundRow( config, players[i].label, verdict, &players[i].metrics );
+		}
+	}
+	printf( "\n" );
+	return 0;
+}
+
 int main( int argc, char** argv )
 {
+	// ghost_probe --roundness <f> / --speed <v> <mode...>: options for every mode, in any order
+	while ( argc >= 3 && ( strcmp( argv[1], "--roundness" ) == 0 || strcmp( argv[1], "--speed" ) == 0 ) )
+	{
+		float value = (float)atof( argv[2] );
+		if ( argv[1][2] == 'r' )
+		{
+			s_roundness = value;
+		}
+		else
+		{
+			s_speed = value;
+		}
+		argv[2] = argv[0];
+		argv += 2;
+		argc -= 2;
+	}
+
+	// ghost_probe --round <scenario> <variant> <sweep value>
+	if ( argc == 5 && strcmp( argv[1], "--round" ) == 0 )
+	{
+		return RoundSweep( argv[2], atoi( argv[3] ), (float)atof( argv[4] ) );
+	}
+
 	if ( argc == 2 && strcmp( argv[1], "--defaults" ) == 0 )
 	{
 		return Defaults();
@@ -592,7 +720,7 @@ int main( int argc, char** argv )
 
 				for ( int wi = 0; wi < scenario->sweepCount; ++wi )
 				{
-					GhostParams params = GhostDefaultParams( si );
+					GhostParams params = ProbeParams( si );
 					params.variant = vi;
 					params.mitigation = (GhostMitigation)mi;
 					SetSweepValue( &params, scenario->sweepField, scenario->sweep[wi] );

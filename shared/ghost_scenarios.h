@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include "box2d/collision.h"
 #include "box2d/id.h"
 #include "box2d/math_types.h"
 #include "topo_ghosts.h"
@@ -33,6 +34,11 @@ extern "C"
 	  GHOST_MITIGATE( ghostMitigation_topological ) )
 #define GHOST_MITIGATIONS_SEMRAU ( GHOST_MITIGATIONS_BASIC | GHOST_MITIGATE( ghostMitigation_semrau ) )
 #define GHOST_MITIGATIONS_ALL ( GHOST_MITIGATIONS_SEMRAU | GHOST_MITIGATE( ghostMitigation_semrauRecycling ) )
+// Scenarios with a polygon player also offer the rounded polygon comparison
+#define GHOST_ROUNDED GHOST_MITIGATE( ghostMitigation_rounded )
+
+// Default GhostParams::roundness: convex radius = 8% of the polygon width
+#define GHOST_DEFAULT_ROUNDNESS 0.08f
 #define GHOST_MAX_SWEEP 5
 #define GHOST_MAX_AUX_BODIES 4
 #define GHOST_MAX_SURFACE_POINTS 128
@@ -54,6 +60,11 @@ typedef enum GhostMitigation
 	// Per-contact topological ghosts (shared/topo_ghosts.c). Contact recycling is disabled.
 	ghostMitigation_topological,
 
+	// No callbacks: every polygon player shape gets a large convex radius (GhostParams::roundness
+	// times its width) with its faces kept in place, so only the corners are rounded (see
+	// GhostRoundPolygon). Circles and capsules are already round: same as none for them.
+	ghostMitigation_rounded,
+
 	ghostMitigation_count
 } GhostMitigation;
 
@@ -72,6 +83,10 @@ typedef struct GhostParams
 	float speed;
 	float gravityScale;
 	float knob;
+
+	// ghostMitigation_rounded only: convex radius as a fraction of the polygon width (its minimum
+	// width across its faces, e.g. the side of a box). 0 leaves the polygons sharp.
+	float roundness;
 } GhostParams;
 
 typedef struct GhostMetrics
@@ -255,6 +270,12 @@ extern const GhostScenario g_ghostScenarios[];
 extern const int g_ghostScenarioCount;
 
 const char* GhostMitigationName( GhostMitigation mitigation );
+
+// Rounded copy of a convex polygon with the same faces: every face plane moves inward by
+// r = roundness * width (width = the polygon's minimum width across its faces) and the convex
+// radius grows by r, so the faces end where they were and only the corners are rounded (radius r
+// arcs). The core's inradius drops by r. Returns the polygon unchanged for roundness <= 0.
+b2Polygon GhostRoundPolygon( const b2Polygon* polygon, float roundness );
 
 // Default parameters for a scenario
 GhostParams GhostDefaultParams( int scenarioIndex );
