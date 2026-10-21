@@ -219,6 +219,10 @@ typedef struct TopoGhostContext
 	TopoStepScene stepScenes[TOPO_MAX_PLAYER_SHAPES];
 	int stepSceneCount;
 
+	// The neighbor snapshot overflowed this step: the topology would be incomplete, so the callbacks
+	// leave Box2D's contacts unchanged for this body and step
+	bool bypass;
+
 	// Diagnostic counters. Not synchronized; exact only with a single worker.
 	TopoGhostStats stats;
 } TopoGhostContext;

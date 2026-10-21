@@ -98,6 +98,7 @@ static bool GatherNeighbor( b2ShapeId shapeId, void* userContext )
 	if ( context->neighborCount == TOPO_MAX_NEIGHBORS )
 	{
 		context->stats.overflow += 1;
+		context->bypass = true;
 		return false;
 	}
 
@@ -978,6 +979,7 @@ void TopoGhost_PreStep( TopoGhostContext* context )
 {
 	context->neighborCount = 0;
 	context->stepSceneCount = 0;
+	context->bypass = false;
 	if ( b2Body_IsValid( context->playerId ) == false )
 	{
 		return;
@@ -999,6 +1001,12 @@ void TopoGhost_PreStep( TopoGhostContext* context )
 	box.upperBound = b2Add( box.upperBound, (b2Vec2){ reach, reach } );
 
 	b2World_OverlapAABB( context->worldId, b2Pos_zero, box, b2DefaultQueryFilter(), GatherNeighbor, context );
+	if ( context->bypass )
+	{
+		// Truncated neighborhoods drop arbitrary shapes (possibly the ground under the body), which is
+		// worse than native contacts with ghost collisions
+		return;
+	}
 
 	// All callbacks of the step see these poses, so the topology is built once here
 	b2ShapeId shapeIds[4 * TOPO_MAX_PLAYER_SHAPES];
@@ -1272,6 +1280,10 @@ static void ReplaceManifold( TopoGhostContext* context, const TopoScene* scene, 
 void TopoGhostPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* userContext )
 {
 	TopoGhostContext* context = userContext;
+	if ( context->bypass )
+	{
+		return;
+	}
 
 	bool playerIsA = B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), context->playerId );
 	bool playerIsB = B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), context->playerId );
@@ -1416,6 +1428,10 @@ static bool JudgeContinuous( TopoGhostContext* context, const TopoScene* scene, 
 bool TopoGhostPreContinuous( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Pos point, b2Vec2 normal, void* userContext )
 {
 	TopoGhostContext* context = userContext;
+	if ( context->bypass )
+	{
+		return true;
+	}
 
 	bool playerIsA = B2_ID_EQUALS( b2Shape_GetBody( shapeIdA ), context->playerId );
 	bool playerIsB = B2_ID_EQUALS( b2Shape_GetBody( shapeIdB ), context->playerId );
