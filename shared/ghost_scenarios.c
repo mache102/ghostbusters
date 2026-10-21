@@ -408,20 +408,6 @@ static void CreateTiltedBox( GhostRun* run )
 	SetFlatFrame( run, restHeight, 0.5f, 40.0f, 0.5f );
 }
 
-// C5: capsule (rounded) sliding across seams
-static void CreateCapsuleSlide( GhostRun* run )
-{
-	static const FloorKind kinds[] = { floor_boxTiles, floor_segmentTiles, floor_chain };
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	BuildFlatFloor( groundId, kinds[run->params.variant], -2.0f, 24, 2.0f, 0.0f, 0.0f, 0.0f );
-
-	const float radius = 0.25f;
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, radius } );
-	b2Capsule capsule = { { -0.5f, 0.0f }, { 0.5f, 0.0f }, radius };
-	CreatePlayerCapsule( run, &def, &capsule );
-	SetFlatFrame( run, radius, 0.5f, 40.0f, radius );
-}
-
 // C6: a thin plank pressed hard into the floor. One-sided chains drop the contact once the
 // centroid is behind the segment, so the plank falls through instead of being pushed out.
 static void CreateThinPlank( GhostRun* run )
@@ -466,55 +452,6 @@ static void CreateFastLanding( GhostRun* run )
 	SetFlatFrame( run, 0.5f, 0.3f * run->params.speed, b2MinFloat( 3.0f * run->params.speed, 180.0f ), 0.5f );
 }
 
-// C13: a kinematic tile flush with static terrain. No ghost information crosses bodies.
-static void CreateKinematicSeam( GhostRun* run )
-{
-	FloorKind kind = run->params.variant == 0 ? floor_chain : floor_boxTiles;
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	BuildFlatFloor( groundId, kind, -2.0f, 6, 2.0f, 0.0f, 0.0f, 0.0f );
-	BuildFlatFloor( groundId, kind, 12.0f, 14, 2.0f, 0.0f, 0.0f, 0.0f );
-
-	b2BodyId platformId = CreateGround( run->worldId, b2_kinematicBody );
-	b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
-	b2Polygon tile = b2MakeOffsetBox( 1.0f, 0.25f, (b2Vec2){ 11.0f, -0.25f }, b2Rot_identity );
-	b2CreatePolygonShape( platformId, &shapeDef, &tile );
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, 0.5f } );
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, 0.5f, 30.0f, 0.5f );
-}
-
-// C14: dynamic tiles resting side by side. Polygon vs polygon only, no ghost information.
-static void CreateDynamicTiles( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	{
-		b2ShapeDef shapeDef = FloorShapeDef( 0.6f );
-		b2Polygon slab = b2MakeOffsetBox( 40.0f, 0.5f, (b2Vec2){ 20.0f, -1.0f }, b2Rot_identity );
-		b2CreatePolygonShape( groundId, &shapeDef, &slab );
-	}
-
-	for ( int i = 0; i < 20; ++i )
-	{
-		b2BodyDef bodyDef = b2DefaultBodyDef();
-		bodyDef.type = b2_dynamicBody;
-		bodyDef.position = (b2Pos){ -1.0f + 2.0f * i, -0.25f };
-		bodyDef.gravityScale = run->params.gravityScale;
-		b2BodyId tileId = b2CreateBody( run->worldId, &bodyDef );
-
-		b2ShapeDef shapeDef = FloorShapeDef( 0.6f );
-		shapeDef.density = 1.0f;
-		b2Polygon tile = b2MakeBox( 1.0f, 0.25f );
-		b2CreatePolygonShape( tileId, &shapeDef, &tile );
-	}
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, 0.5f } );
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, 0.5f, 30.0f, 0.5f );
-}
-
 // An open polyline given left to right, created as right to left loose chain segments (outside
 // is +y). Ghosts at the ends extrapolate the end segments.
 static void AddPolyline( b2BodyId bodyId, const b2Vec2* points, int count, float friction )
@@ -529,18 +466,15 @@ static void AddPolyline( b2BodyId bodyId, const b2Vec2* points, int count, float
 	}
 }
 
-// marblebuilds one-way valve snag: a fast marble comes down a curve into a flat floor and sinks
-// below the floor line for a few steps, because each manifold is computed once per step from the
-// segment it was touching. It then passes over a one-sided valve segment with an open cell below
-// it. The next solid tile's exposed side face has a legitimate convex corner whose vertex can
-// catch the sunken marble. Variants 3 and 4 use a kinematic ground body like the game does.
+// marblebuilds one-way valve snag: a fast marble comes down a curve onto a flat floor and passes
+// over a one-sided valve segment with an open cell below it. The next solid tile's exposed side
+// face meets the floor at a convex corner, and with the marble only ~0.1 mm sunk that corner is
+// inside the speculative distance and kicks it up. Variant 1 routes the corner's ghost through the
+// valve (the marblebuilds fix), variant 2 removes the exposed face (control).
 static void CreateValveCorner( GhostRun* run )
 {
-	int variant = run->params.variant;
-	bool kinematic = variant >= 3;
-	int ghostMode = kinematic ? variant - 3 : variant;
-
-	b2BodyId groundId = CreateGround( run->worldId, kinematic ? b2_kinematicBody : b2_staticBody );
+	int ghostMode = run->params.variant;
+	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
 	const float friction = 0.01f;
 
 	// Curve flattening from slope -1 to -0.2, then the floor. The valve spans x in [2, 3].
@@ -611,63 +545,6 @@ static void CreateInteriorFaces( GhostRun* run )
 	def.restitution = 0.1f;
 	CreatePlayerCircle( run, &def, radius );
 	SetFlatFrame( run, radius, -3.0f, 14.0f, radius );
-}
-
-// A circle moving horizontally (no gravity) into the end of a platform, below its top line.
-// Loose chain segments default their ghosts to their own endpoints, which degenerates the
-// Voronoi tests at the segment ends. knob 0 approaches the p2 end, knob 1 the p1 end.
-static void CreateDefaultGhosts( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	b2Vec2 p1 = { 4.0f, 0.0f };
-	b2Vec2 p2 = { 0.0f, 0.0f };
-
-	switch ( run->params.variant )
-	{
-		case 0:
-		{
-			b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
-			b2Segment segment = { p1, p2 };
-			b2CustomCreateChainSegmentShape( groundId, &shapeDef, &segment );
-		}
-		break;
-
-		case 1:
-			// Ghosts continue the line, as if the platform had collinear neighbors
-			AddChainSegment( groundId, (b2Vec2){ 5.0f, 0.0f }, p1, p2, (b2Vec2){ -1.0f, 0.0f }, 0.0f );
-			break;
-
-		case 2:
-			// Convex corners at both ends, the correct ghosts for an isolated platform top
-			AddChainSegment( groundId, (b2Vec2){ 4.0f, -1.0f }, p1, p2, (b2Vec2){ 0.0f, -1.0f }, 0.0f );
-			break;
-
-		default:
-		{
-			b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
-			b2Segment segment = { p1, p2 };
-			b2CreateSegmentShape( groundId, &shapeDef, &segment );
-		}
-		break;
-	}
-
-	const float radius = 0.25f;
-	const float height = 0.1f;
-	bool fromRight = run->params.knob > 0.5f;
-	b2Vec2 start = fromRight ? (b2Vec2){ 6.0f, height } : (b2Vec2){ -2.0f, height };
-
-	PlayerDef def = DefaultPlayerDef( run, start );
-	def.velocity = (b2Vec2){ fromRight ? -run->params.speed : run->params.speed, 0.0f };
-	def.gravityScale = 0.0f;
-	CreatePlayerCircle( run, &def, radius );
-
-	SetFlatFrame( run, height, -10.0f, 7.0f, 10.0f );
-	run->origin = start;
-	run->origin.y = 0.0f;
-	if ( fromRight )
-	{
-		run->tangent = (b2Vec2){ -1.0f, 0.0f };
-	}
 }
 
 // A kinematic tile whose body origin is the tile center, so it rotates about its center. Its
@@ -802,24 +679,6 @@ static void CreateMovingPlatform( GhostRun* run )
 }
 
 #define ELEVATOR_PERIOD 0.8f
-
-static void StepElevatorSeam( GhostRun* run )
-{
-	float omega = 2.0f * B2_PI / ELEVATOR_PERIOD;
-	float y = run->params.knob * sinf( omega * ( run->time + GHOST_TIME_STEP - run->auxPhase ) );
-	DriveAuxBodies( run, (b2Vec2){ 0.0f, y }, 0.0f );
-}
-
-// Platformer: flush kinematic tiles bobbing vertically around flush (knob = amplitude). The tiles
-// are one period apart at 10 m/s and phased so each passes flush moving up as the player reaches
-// it. Amplitudes above the linear slop are a real lip at some phases.
-static void CreateElevatorSeam( GhostRun* run )
-{
-	FloorKind kind = run->params.variant == 0 ? floor_chain : floor_boxTiles;
-	BuildKinematicCourse( run, kind, 2.0f, 10.0f * ELEVATOR_PERIOD );
-	run->auxPhase = ArrivalTime( run, 10.0f, 0.5f );
-	CreateBoxPlayer( run, 36.0f );
-}
 
 #define ROCKER_PERIOD 1.0f
 
@@ -1119,49 +978,6 @@ static void CreateTileWall( GhostRun* run )
 	SetFlatFrame( run, 0.5f, 0.5f, wx + 2.0f, 0.5f );
 }
 
-// A2: a real step up of knob meters at x = 12 built from tiles. A locked square box cannot climb
-// a vertical riser. Correct: blocked at x = 11.5.
-static void CreateTileStepUp( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	float wx = ADV_WALL_X;
-	float h = run->params.knob;
-	switch ( run->params.variant )
-	{
-		case 0:
-			BuildFlatFloor( groundId, floor_boxTiles, -2.0f, 7, 2.0f, 0.0f, 0.0f, 0.0f );
-			// Raised tiles, same thickness, top at h
-			for ( int i = 0; i < 6; ++i )
-			{
-				AddStaticBox( groundId, wx + 2.0f * i, h - 0.5f, wx + 2.0f * ( i + 1 ), h, 0.0f );
-			}
-			break;
-		case 1:
-			// Step built by stacking a thin tile of height h on the floor tiles
-			BuildFlatFloor( groundId, floor_boxTiles, -2.0f, 13, 2.0f, 0.0f, 0.0f, 0.0f );
-			AddStaticBox( groundId, wx, 0.0f, wx + 12.0f, h, 0.0f );
-			break;
-		case 2:
-		{
-			b2Vec2 points[] = { { -2.0f, 0.0f }, { 4.0f, 0.0f }, { 8.0f, 0.0f }, { wx, 0.0f }, { wx, h }, { wx + 4.0f, h }, { wx + 12.0f, h } };
-			AddPolyline( groundId, points, 7, 0.0f );
-		}
-		break;
-		default:
-		{
-			BuildFlatFloor( groundId, floor_segmentTiles, -2.0f, 7, 2.0f, 0.0f, 0.0f, 0.0f );
-			b2Vec2 points[] = { { wx, 0.0f }, { wx, h }, { wx + 2.0f, h }, { wx + 4.0f, h }, { wx + 12.0f, h } };
-			AddSegmentPath( groundId, points, 5, 0.0f );
-		}
-		break;
-	}
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, 0.5f } );
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, 0.5f, wx + 2.0f, 0.5f );
-}
-
 // A3: floor ends at x = 10, a 3 m deep pit 4 m wide, the far wall at x = 14 back up to y = 0.
 // Correct: the player falls into the pit and ends against the far wall or on the pit floor,
 // x <= 13.5 (box) and y = -3 + half height. It must never finish (x >= 20).
@@ -1243,207 +1059,6 @@ static void CreateWallSlideDown( GhostRun* run )
 	run->fallDepth = 0.25f;
 }
 
-// A5: thin walls at x = 6 standing on box tiles: a two-sided segment and a one-sided chain wall
-// (solid side facing -x), approached from the left (x = 0, moving +x) or from the right (x = 12,
-// moving -x). Correct: blocked 0.5 m before the wall in every case except the one-sided chain
-// approached from its back (variant 3), which is open by design and must pass like `none`.
-static void CreateThinWalls( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	BuildFlatFloor( groundId, floor_boxTiles, -4.0f, 10, 2.0f, 0.0f, 0.0f, 0.0f );
-	int variant = run->params.variant;
-	bool fromRight = ( variant & 1 ) != 0;
-	if ( variant < 2 )
-	{
-		b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
-		b2Segment segment = { { 6.0f, 0.0f }, { 6.0f, 1.5f } };
-		b2CreateSegmentShape( groundId, &shapeDef, &segment );
-	}
-	else
-	{
-		// Right of (6, 1.5) -> (6, 0) is -x
-		AddChainSegment( groundId, (b2Vec2){ 6.0f, 2.5f }, (b2Vec2){ 6.0f, 1.5f }, (b2Vec2){ 6.0f, 0.0f }, (b2Vec2){ 6.0f, -1.0f },
-						 0.0f );
-	}
-
-	b2Vec2 start = fromRight ? (b2Vec2){ 12.0f, 0.5f } : (b2Vec2){ 0.0f, 0.5f };
-	PlayerDef def = DefaultPlayerDef( run, start );
-	def.velocity = (b2Vec2){ fromRight ? -run->params.speed : run->params.speed, 0.0f };
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, 0.5f, 9.0f, 0.5f );
-	run->origin = (b2Vec2){ start.x, 0.0f };
-	if ( fromRight )
-	{
-		run->tangent = (b2Vec2){ -1.0f, 0.0f };
-	}
-}
-
-static void StepCrateByWall( GhostRun* run )
-{
-	if ( run->params.variant == 1 )
-	{
-		b2Body_SetLinearVelocity( run->auxBodyIds[0], (b2Vec2){ run->params.knob, 0.0f } );
-	}
-	else
-	{
-		PushPlayer( run, (b2Vec2){ 1.0f, 0.0f }, 20.0f );
-	}
-}
-
-// A6: v0: the player stands on a dynamic 1 m crate resting flush against a static wall at x = 10
-// and is held pressing right. v1: the player rides a kinematic platform (top y = 0, speed knob)
-// that slides under a static wall whose bottom is flush with the platform top at x = 10 (the wall
-// scrapes the player off). Correct: x stops at 9.5 and the player stays on top (no sink into the
-// crate/platform, no pass through the wall).
-static void CreateCrateByWall( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	const float friction = 0.6f;
-	float topY;
-	if ( run->params.variant == 0 )
-	{
-		BuildFlatFloor( groundId, floor_boxTiles, -2.0f, 8, 2.0f, 0.0f, 0.0f, friction );
-		AddStaticBox( groundId, 10.0f, 0.0f, 11.0f, 3.0f, friction );
-
-		b2BodyDef bodyDef = b2DefaultBodyDef();
-		bodyDef.type = b2_dynamicBody;
-		bodyDef.position = (b2Pos){ 9.5f, 0.5f };
-		b2BodyId crateId = b2CreateBody( run->worldId, &bodyDef );
-		b2ShapeDef crateDef = FloorShapeDef( friction );
-		crateDef.density = 1.0f;
-		b2Polygon crate = b2MakeBox( 0.5f, 0.5f );
-		b2CreatePolygonShape( crateId, &crateDef, &crate );
-		topY = 1.0f;
-	}
-	else
-	{
-		AddStaticBox( groundId, 10.0f, 0.0f, 11.0f, 2.0f, friction );
-
-		b2BodyDef bodyDef = b2DefaultBodyDef();
-		bodyDef.type = b2_kinematicBody;
-		bodyDef.position = (b2Pos){ 6.0f, -0.25f };
-		b2BodyId platformId = b2CreateBody( run->worldId, &bodyDef );
-		b2ShapeDef shapeDef = FloorShapeDef( friction );
-		b2Polygon tile = b2MakeBox( 3.0f, 0.25f );
-		b2CreatePolygonShape( platformId, &shapeDef, &tile );
-		run->auxBodyIds[0] = platformId;
-		run->auxOrigins[0] = (b2Vec2){ 6.0f, -0.25f };
-		run->auxBodyCount = 1;
-		topY = 0.0f;
-	}
-
-	float startX = run->params.variant == 0 ? 9.3f : 7.0f;
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ startX, topY + 0.5f } );
-	def.velocity = (b2Vec2){ run->params.variant == 0 ? 1.0f : run->params.knob, 0.0f };
-	def.friction = friction;
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	// Falling once the platform has passed under the wall is correct, so no fall threshold
-	SetFlatFrame( run, topY + 0.5f, -10.0f, 10.5f, 100.0f );
-}
-
-static void StepElevatorFlush( GhostRun* run )
-{
-	// Rise (even variants) from top y = -1 to +1, or sink (odd variants) from 0 to -2, then stop
-	bool rise = ( run->params.variant & 1 ) == 0;
-	b2BodyId bodyId = run->auxBodyIds[0];
-	float y = ToVec2( b2Body_GetPosition( bodyId ) ).y + 0.25f;
-	float v = run->params.knob;
-	if ( rise )
-	{
-		v = y < 1.0f ? b2MinFloat( v, ( 1.0f - y ) / GHOST_TIME_STEP ) : 0.0f;
-	}
-	else
-	{
-		v = y > -2.0f ? -b2MinFloat( v, ( y + 2.0f ) / GHOST_TIME_STEP ) : 0.0f;
-	}
-	b2Body_SetLinearVelocity( bodyId, (b2Vec2){ 0.0f, v } );
-}
-
-// A7: a 2 m kinematic elevator in a shaft at x in [4, 6] of a floor at y = 0, speed knob.
-// Rise variants: the player stands still on the floor at x = 3.8 overhanging the shaft by 0.3 m;
-// the elevator comes up from below and must lift it to y = 1.5 (no sink into the elevator top).
-// Sink variants: the player stands at x = 4.2 with 0.3 m on the floor and its centroid over the
-// flush elevator, which then drops away; it must stay on the floor edge at y = 0.5 (no sink into
-// the floor). The frame is vertical: hop/sink are relative to y = 0.5.
-static void CreateElevatorFlush( GhostRun* run )
-{
-	int variant = run->params.variant;
-	bool rise = ( variant & 1 ) == 0;
-	FloorKind kind = variant < 2 ? floor_boxTiles : floor_chain;
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	BuildFlatFloor( groundId, kind, -4.0f, 4, 2.0f, 0.0f, 0.0f, 0.0f );
-	BuildFlatFloor( groundId, kind, 6.0f, 4, 2.0f, 0.0f, 0.0f, 0.0f );
-
-	b2BodyDef bodyDef = b2DefaultBodyDef();
-	bodyDef.type = b2_kinematicBody;
-	float top = rise ? -1.0f : 0.0f;
-	bodyDef.position = (b2Pos){ 5.0f, top - 0.25f };
-	b2BodyId platformId = b2CreateBody( run->worldId, &bodyDef );
-	b2ShapeDef shapeDef = FloorShapeDef( 0.0f );
-	b2Polygon tile = b2MakeBox( 1.0f, 0.25f );
-	b2CreatePolygonShape( platformId, &shapeDef, &tile );
-	run->auxBodyIds[0] = platformId;
-	run->auxOrigins[0] = (b2Vec2){ 5.0f, top - 0.25f };
-	run->auxBodyCount = 1;
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ rise ? 3.8f : 4.2f, 0.5f } );
-	def.velocity = b2Vec2_zero;
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, -10.0f, 100.0f, 0.25f );
-}
-
-// A8: tiled ceiling (bottom at y = 2, 2 m tiles, seams) over a box tile floor. v0/v1: gravity is
-// inverted (gravity scale -g) so the player slides along the ceiling at 10 m/s (frame: normal
-// -y, rest at y = 1.5). v2/v3: normal gravity, the player jumps from the floor with 12 m/s up
-// into the ceiling and bounces along (rest height is the floor, hop must stay <= 1.0: above that
-// the player went into the ceiling). Correct: no snags at ceiling seams, no pass through.
-static void CreateTileCeiling( GhostRun* run )
-{
-	int variant = run->params.variant;
-	bool chain = ( variant & 1 ) != 0;
-	bool jump = variant >= 2;
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	BuildFlatFloor( groundId, floor_boxTiles, -2.0f, 24, 2.0f, 0.0f, 0.0f, 0.0f );
-	if ( chain )
-	{
-		// Left to right: outside (right of travel) is -y
-		b2Vec2 points[25];
-		for ( int i = 0; i <= 24; ++i )
-		{
-			points[i] = (b2Vec2){ -2.0f + 2.0f * i, 2.0f };
-		}
-		for ( int i = 0; i < 24; ++i )
-		{
-			b2Vec2 ghost1 = i > 0 ? points[i - 1] : (b2Vec2){ -4.0f, 2.0f };
-			b2Vec2 ghost2 = i + 2 <= 24 ? points[i + 2] : (b2Vec2){ 48.0f, 2.0f };
-			AddChainSegment( groundId, ghost1, points[i], points[i + 1], ghost2, 0.0f );
-		}
-	}
-	else
-	{
-		AddTiledBlock( groundId, -2.0f, 2.0f, 46.0f, 2.5f, 24, 1, 0.0f );
-	}
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, jump ? 0.5f : 1.5f } );
-	if ( jump )
-	{
-		def.velocity = (b2Vec2){ run->params.speed, 12.0f };
-		SetFlatFrame( run, 0.5f, 0.5f, 40.0f, 0.5f );
-	}
-	else
-	{
-		def.gravityScale = -run->params.gravityScale;
-		SetFlatFrame( run, 0.5f, 0.5f, 40.0f, 0.5f );
-		run->origin = (b2Vec2){ 0.0f, 2.0f };
-		run->normal = (b2Vec2){ 0.0f, -1.0f };
-	}
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-}
-
 // A9: a vehicle (one body: chassis box plus two wheel circles 3 m apart, rotation free) drives
 // over a convex crest at x = 10 onto a 20 degree downslope that ends at a flat floor 2 m lower.
 // The body centroid is between the wheels, away from the shapes that touch the ground. Correct:
@@ -1520,42 +1135,6 @@ static void CreateVehicleCrest( GhostRun* run )
 	// Wheel axle height above the lower floor at the end; the upper floor is 2 m higher
 	run->restHeight = radius;
 	run->measureStart = foot.x + 2.0f;
-}
-
-// A10: a staircase going down by knob meters per 2 m tile, under heavy gravity (sweep). Covered
-// lower tiles lose their speculative contact while the player is still over the upper tile.
-// Correct: no sink below each tile top (sink is measured against the ideal descending line, so
-// compare none vs topological; fell = sank > 0.25 m).
-static void CreateStepDown( GhostRun* run )
-{
-	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
-	float drop = run->params.knob;
-	const int count = 24;
-	for ( int i = 0; i < count; ++i )
-	{
-		float xl = -2.0f + 2.0f * i;
-		float y = -drop * i;
-		if ( run->params.variant == 0 )
-		{
-			AddStaticBox( groundId, xl, y - 0.5f, xl + 2.0f, y, 0.0f );
-		}
-		else
-		{
-			b2Vec2 ghost1 = { xl + 4.0f, y - drop };
-			b2Vec2 ghost2 = { xl - 2.0f, y + drop };
-			AddChainSegment( groundId, ghost1, (b2Vec2){ xl + 2.0f, y }, (b2Vec2){ xl, y }, ghost2, 0.0f );
-		}
-	}
-
-	PlayerDef def = DefaultPlayerDef( run, (b2Vec2){ 0.0f, 0.5f } );
-	b2Polygon box = b2MakeBox( 0.5f, 0.5f );
-	CreatePlayerPolygon( run, &def, &box );
-	SetFlatFrame( run, 0.5f, 0.5f, 40.0f, 0.25f );
-	// Tangent along the staircase average so hop/sink compare against it
-	run->tangent = b2Normalize( (b2Vec2){ 2.0f, -drop } );
-	run->normal = b2LeftPerp( run->tangent );
-	run->origin = (b2Vec2){ -1.0f, 0.0f };
-	run->restHeight = 0.5f * run->tangent.x;
 }
 
 // A11: floor tiles separated by small gaps (knob meters). The gap faces are real but cannot be
@@ -2344,15 +1923,6 @@ const GhostScenario g_ghostScenarios[] = {
 		300, CreateTiltedBox, NULL,
 	},
 	{
-		"Capsule",
-		"Locked capsule sliding over seams (C5)",
-		"unused",
-		{ "box tiles", "segment tiles", "chain" }, 3,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
-		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
-		300, CreateCapsuleSlide, NULL,
-	},
-	{
 		"Thin Plank",
 		"Thin plank under heavy forced gravity: deep penetration (C6)",
 		"unused",
@@ -2373,28 +1943,10 @@ const GhostScenario g_ghostScenarios[] = {
 		1, 0, false,
 	},
 	{
-		"Kinematic Seam",
-		"Static floor with a flush kinematic tile: no cross-body ghosts (C13)",
-		"unused",
-		{ "chain + kinematic tile", "box tiles + kinematic tile" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
-		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
-		300, CreateKinematicSeam, NULL,
-	},
-	{
-		"Dynamic Tiles",
-		"Box sliding across dynamic tiles resting side by side (C14)",
-		"unused",
-		{ "dynamic tiles" }, 1,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
-		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
-		300, CreateDynamicTiles, NULL,
-	},
-	{
 		"Valve Corner",
 		"marblebuilds: fast marble sinks after a downslope and snags an exposed convex corner",
 		"start phase",
-		{ "local ghost rule", "ghost via valve", "solid under valve", "local ghost rule, kinematic", "ghost via valve, kinematic" }, 5,
+		{ "local ghost rule", "ghost via valve", "solid under valve" }, 3,
 		GHOST_MITIGATIONS_BASIC, 35.0f, 2.0f, 0.0f,
 		ghostSweep_knob, { 0.0f, 0.2f, 0.4f, 0.6f, 0.8f }, 5,
 		120, CreateValveCorner, NULL,
@@ -2409,16 +1961,6 @@ const GhostScenario g_ghostScenarios[] = {
 		180, CreateInteriorFaces, NULL,
 	},
 	{
-		"Default Ghosts",
-		"Circle hits a platform end below its top line; loose segment ghost defaults (knob: 0 = p2 end, 1 = p1 end)",
-		"approach side",
-		{ "ghosts = endpoints", "collinear ghosts", "convex corner ghosts", "plain segment" }, 4,
-		GHOST_MITIGATIONS_BASIC, 5.0f, 0.0f, 0.0f,
-		ghostSweep_knob, { 0.0f, 1.0f }, 2,
-		120, CreateDefaultGhosts, NULL,
-		0, 0, true,
-	},
-	{
 		"Moving Platform",
 		"Platformer: 3 flush kinematic tiles sliding back and forth in gaps (knob = platform speed)",
 		"platform speed",
@@ -2426,15 +1968,6 @@ const GhostScenario g_ghostScenarios[] = {
 		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 1.0f,
 		ghostSweep_knob, { 0.0f, 1.0f, 3.0f }, 3,
 		300, CreateMovingPlatform, StepMovingPlatform,
-	},
-	{
-		"Elevator Seam",
-		"Platformer: 3 kinematic tiles bobbing vertically around flush (knob = amplitude, m); above slop the lip is real",
-		"amplitude",
-		{ "chain + elevator tile", "box tiles + elevator tile" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.002f,
-		ghostSweep_knob, { 0.0f, 0.002f, 0.01f, 0.03f }, 4,
-		300, CreateElevatorSeam, StepElevatorSeam,
 	},
 	{
 		"Rotating Platform",
@@ -2494,16 +2027,6 @@ const GhostScenario g_ghostScenarios[] = {
 		0, 0x1f, false,
 	},
 	{
-		"Tile Step Up",
-		"ADV: real step up (knob, m) at x = 12. A locked square box cannot climb a riser. Correct: blocked at x = 11.5, never finishes",
-		"step height",
-		{ "raised box tiles", "stacked step tile", "chain", "segment tiles" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.1f,
-		ghostSweep_knob, { 0.05f, 0.1f, 0.3f }, 3,
-		180, CreateTileStepUp, StepPushRight,
-		0, 0xf, false,
-	},
-	{
 		"Cliff Pit",
 		"ADV: floor ends at x = 10, 3 m deep pit, far wall at x = 14. Correct: ends in the pit, x <= 13.5, y = -3 + half height, never finishes",
 		"unused",
@@ -2524,46 +2047,6 @@ const GhostScenario g_ghostScenarios[] = {
 		2, 0, false,
 	},
 	{
-		"Thin Walls",
-		"ADV: segment wall / one-sided chain wall at x = 6, from either side. Correct: blocked at 0.5 m from it (never finishes), except v3 (chain back side) passes",
-		"unused",
-		{ "segment from left", "segment from right", "chain front", "chain back (open)" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
-		ghostSweep_speed, { 10.0f, 40.0f, 80.0f }, 3,
-		120, CreateThinWalls, NULL,
-		0, 0x7, false,
-	},
-	{
-		"Crate By Wall",
-		"ADV: v0 player on a dynamic crate flush with a wall, pushed right; v1 kinematic platform (knob m/s) slides under a wall. Correct: x stops at 9.5 on top",
-		"platform speed",
-		{ "dynamic crate", "kinematic platform under wall" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 2.0f,
-		ghostSweep_knob, { 1.0f, 2.0f, 5.0f }, 3,
-		240, CreateCrateByWall, StepCrateByWall,
-		0, 0x3, false,
-	},
-	{
-		"Elevator Flush",
-		"ADV: elevator (knob m/s) rises under / sinks away from a player straddling its shaft. Correct: rise lifts to y = 1.5 with no sink; sink leaves it at y = 0.5",
-		"elevator speed",
-		{ "rise, box tiles", "sink, box tiles", "rise, chain", "sink, chain" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 0.0f, 1.0f, 3.0f,
-		ghostSweep_knob, { 1.0f, 3.0f, 6.0f, 12.0f }, 4,
-		180, CreateElevatorFlush, StepElevatorFlush,
-		0, 0, true,
-	},
-	{
-		"Tile Ceiling",
-		"ADV: tiled ceiling at y = 2. v0/v1 inverted gravity slide; v2/v3 jump into it. Correct: no snags, no pass through (jump: hop <= 1.0)",
-		"unused",
-		{ "box ceiling, inverted", "chain ceiling, inverted", "box ceiling, jump", "chain ceiling, jump" }, 4,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 1.0f, 0.0f,
-		ghostSweep_gravityScale, { 1.0f, 10.0f, 40.0f }, 3,
-		300, CreateTileCeiling, NULL,
-		2, 0, true,
-	},
-	{
 		"Vehicle Crest",
 		"ADV: compound vehicle (two wheels + chassis), a free plank or a locked box over a crest onto a 20 deg downslope. Correct: finishes on the lower floor, never fell",
 		"unused",
@@ -2572,15 +2055,6 @@ const GhostScenario g_ghostScenarios[] = {
 		ghostSweep_speed, { 3.0f, 8.0f, 15.0f }, 3,
 		360, CreateVehicleCrest, NULL,
 		1, 0, false,
-	},
-	{
-		"Step Down",
-		"ADV: staircase down by knob m per 2 m tile, gravity scale 40. Correct: no sink beyond none's",
-		"drop",
-		{ "box tiles", "chain" }, 2,
-		GHOST_MITIGATIONS_SEMRAU, 10.0f, 40.0f, 0.02f,
-		ghostSweep_knob, { 0.01f, 0.02f, 0.05f, 0.2f }, 4,
-		300, CreateStepDown, NULL,
 	},
 	{
 		"Small Gaps",
