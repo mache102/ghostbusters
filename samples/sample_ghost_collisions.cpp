@@ -1,0 +1,194 @@
+// SPDX-FileCopyrightText: 2026 mache102
+// SPDX-License-Identifier: MIT
+
+// Ghost collision challenge scenarios from shared/ghost_scenarios.c. The same scenarios are swept
+// headlessly by experiments/ghost_probe. See notes/ghost_collisions.md.
+
+#include "ghost_scenarios.h"
+#include "sample.h"
+
+#include "box2d/box2d.h"
+#include "box2d/math_functions.h"
+
+#include <imgui.h>
+
+template <int ScenarioIndex>
+class GhostCollisionSample : public Sample
+{
+public:
+	explicit GhostCollisionSample( SampleContext* context )
+		: Sample( context )
+	{
+		if ( s_initialized == false )
+		{
+			s_params = GhostDefaultParams( ScenarioIndex );
+			s_initialized = true;
+		}
+
+		if ( m_context->restart == false )
+		{
+			m_context->camera.zoom = 8.0f;
+		}
+
+		m_relaunch = false;
+		Launch();
+	}
+
+	void Launch()
+	{
+		GhostRun_Create( &m_run, m_worldId, ScenarioIndex, s_params );
+		if ( s_follow )
+		{
+			b2Pos p = b2Body_GetPosition( m_run.playerId );
+			m_context->camera.center = { p.x, p.y + 1.0f };
+		}
+	}
+
+	bool DrawControls() override
+	{
+		const GhostScenario& scenario = g_ghostScenarios[ScenarioIndex];
+		bool changed = false;
+
+		ImGui::PushItemWidth( 12.0f * ImGui::GetFontSize() );
+		changed |= ImGui::Combo( "Variant", &s_params.variant, scenario.variantNames, scenario.variantCount );
+
+		// Before / after: switch between no mitigation, Semrau and topological ghosts
+		const char* mitigations[ghostMitigation_count];
+		int mitigationValues[ghostMitigation_count];
+		int mitigationCount = 0;
+		int current = 0;
+		for ( int i = 0; i < ghostMitigation_count; ++i )
+		{
+			if ( scenario.mitigationMask & GHOST_MITIGATE( i ) )
+			{
+				if ( i == (int)s_params.mitigation )
+				{
+					current = mitigationCount;
+				}
+				mitigations[mitigationCount] = GhostMitigationName( (GhostMitigation)i );
+				mitigationValues[mitigationCount] = i;
+				mitigationCount += 1;
+			}
+		}
+
+		if ( ImGui::Combo( "Mitigation", &current, mitigations, mitigationCount ) )
+		{
+			s_params.mitigation = (GhostMitigation)mitigationValues[current];
+			changed = true;
+		}
+
+		ImGui::PopItemWidth();
+		ImGui::PushItemWidth( 8.0f * ImGui::GetFontSize() );
+		changed |= ImGui::SliderFloat( "Speed", &s_params.speed, 0.0f, 100.0f, "%.1f" );
+		changed |= ImGui::SliderFloat( "Gravity scale", &s_params.gravityScale, 0.0f, 5000.0f, "%.1f",
+									   ImGuiSliderFlags_Logarithmic );
+		if ( scenario.knobName[0] != 'u' )
+		{
+			changed |= ImGui::InputFloat( scenario.knobName, &s_params.knob, 0.0f, 0.0f, "%.4f" );
+		}
+		ImGui::PopItemWidth();
+
+		ImGui::Checkbox( "Follow", &s_follow );
+
+		if ( ImGui::Button( "Relaunch" ) || changed )
+		{
+			m_relaunch = true;
+		}
+
+		if ( ImGui::Button( "Defaults" ) )
+		{
+			s_params = GhostDefaultParams( ScenarioIndex );
+			m_relaunch = true;
+		}
+
+		return true;
+	}
+
+	void Step() override
+	{
+		if ( m_relaunch )
+		{
+			m_relaunch = false;
+			CreateWorld();
+			m_mouseJointId = b2_nullJointId;
+			Launch();
+		}
+
+		GhostRun_PreStep( &m_run );
+		Sample::Step();
+
+		if ( m_didStep )
+		{
+			GhostRun_Update( &m_run );
+		}
+
+		if ( s_follow )
+		{
+			b2Pos p = b2Body_GetPosition( m_run.playerId );
+			m_context->camera.center = { p.x, p.y + 1.0f };
+		}
+
+		const GhostScenario& scenario = g_ghostScenarios[ScenarioIndex];
+		const GhostMetrics& m = m_run.metrics;
+		DrawScreenTextLine( "%s", scenario.summary );
+		DrawScreenTextLine( "variant: %s, mitigation: %s", scenario.variantNames[s_params.variant],
+							GhostMitigationName( s_params.mitigation ) );
+		DrawScreenTextLine( "progress %.2f / %.2f (time ratio %.3f)%s", m.progress, m_run.pathLength,
+							m.idealProgress > 0.0f ? m.progress / m.idealProgress : 0.0f, m.finished ? " finished" : "" );
+		DrawScreenTextLine( "min speed ratio %.3f, snags %d", m.minSpeedRatio > 1e30f ? 1.0f : m.minSpeedRatio, m.snagCount );
+		DrawScreenTextLine( "max hop %.4f, max sink %.4f, max kick %.3f", m.maxHop, m.maxSink, m.maxKick );
+		DrawScreenTextLine( "culled contacts %d%s", m.rejectedCount, m.fellThrough ? ", FELL THROUGH" : "" );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new GhostCollisionSample( context );
+	}
+
+	// The run is referenced by the pre-solve callbacks, so it lives in the sample
+	GhostRun m_run;
+	bool m_relaunch;
+
+	static inline GhostParams s_params;
+	static inline bool s_initialized = false;
+	static inline bool s_follow = true;
+};
+
+template <int ScenarioIndex>
+static int RegisterGhostCollision()
+{
+	return RegisterSample( "Ghost Collisions", g_ghostScenarios[ScenarioIndex].name,
+						   GhostCollisionSample<ScenarioIndex>::Create );
+}
+
+// Keep in sync with g_ghostScenarios
+static int sampleGhost0 = RegisterGhostCollision<0>();
+static int sampleGhost1 = RegisterGhostCollision<1>();
+static int sampleGhost2 = RegisterGhostCollision<2>();
+static int sampleGhost3 = RegisterGhostCollision<3>();
+static int sampleGhost4 = RegisterGhostCollision<4>();
+static int sampleGhost5 = RegisterGhostCollision<5>();
+static int sampleGhost6 = RegisterGhostCollision<6>();
+static int sampleGhost7 = RegisterGhostCollision<7>();
+static int sampleGhost8 = RegisterGhostCollision<8>();
+static int sampleGhost9 = RegisterGhostCollision<9>();
+static int sampleGhost10 = RegisterGhostCollision<10>();
+static int sampleGhost11 = RegisterGhostCollision<11>();
+static int sampleGhost12 = RegisterGhostCollision<12>();
+static int sampleGhost13 = RegisterGhostCollision<13>();
+static int sampleGhost14 = RegisterGhostCollision<14>();
+static int sampleGhost15 = RegisterGhostCollision<15>();
+static int sampleGhost16 = RegisterGhostCollision<16>();
+static int sampleGhost17 = RegisterGhostCollision<17>();
+static int sampleGhost18 = RegisterGhostCollision<18>();
+static int sampleGhost19 = RegisterGhostCollision<19>();
+static int sampleGhost20 = RegisterGhostCollision<20>();
+static int sampleGhost21 = RegisterGhostCollision<21>();
+static int sampleGhost22 = RegisterGhostCollision<22>();
+static int sampleGhost23 = RegisterGhostCollision<23>();
+static int sampleGhost24 = RegisterGhostCollision<24>();
+static int sampleGhost25 = RegisterGhostCollision<25>();
+static int sampleGhost26 = RegisterGhostCollision<26>();
+static int sampleGhost27 = RegisterGhostCollision<27>();
+static int sampleGhost28 = RegisterGhostCollision<28>();
+static int sampleGhost29 = RegisterGhostCollision<29>();

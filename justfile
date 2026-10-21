@@ -22,3 +22,7 @@ test filter="": rebuild
 # Wipe the build directory
 clean:
     rm -rf {{build_dir}}
+
+# Build, then run the headless ghost collision probe. Optional scenario filter, e.g. `just probe Valve`
+probe filter="": rebuild
+    ./{{build_dir}}/bin/ghost_probe {{filter}}

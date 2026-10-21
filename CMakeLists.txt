@@ -122,6 +122,9 @@ if(PROJECT_IS_TOP_LEVEL)
 
 	if(BOX2D_UNIT_TESTS OR BOX2D_SAMPLES OR BOX2D_BENCHMARKS)
 		add_subdirectory(shared)
+
+		# Ghostbusters: headless ghost collision probe
+		add_subdirectory(experiments/ghost_probe)
 	endif()
 
 	# Tests need static linkage because they test internal Box2D functions

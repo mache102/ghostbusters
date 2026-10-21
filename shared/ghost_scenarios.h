@@ -1,0 +1,178 @@
+// SPDX-FileCopyrightText: 2026 mache102
+// SPDX-License-Identifier: MIT
+#pragma once
+
+#include "box2d/id.h"
+#include "box2d/math_types.h"
+#include "topo_ghosts.h"
+
+#include <stdbool.h>
+
+// Ghost collision challenge scenarios. Each scenario builds a small world around a single
+// "player" body and measures how it moves across seams, so the same setup can be visualized in
+// the samples app ("Ghost Collisions" category) and swept headlessly by the ghost_probe tool.
+//
+// The player starts resting on (or flying toward) a surface whose ideal response is known: it
+// should keep its tangential speed and stay at a constant height. Deviations are recorded as
+// ghost collision symptoms: snags (sudden tangential speed loss), hops/kicks (motion along the
+// surface normal), sinking, and falling through.
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#define GHOST_MAX_VARIANTS 6
+
+#define GHOST_MITIGATE( m ) ( 1u << ( m ) )
+// Semrau is offered everywhere for comparison, even where it is a no-op (circles: 1-point contacts)
+#define GHOST_MITIGATIONS_BASIC                                                                                                  \
+	( GHOST_MITIGATE( ghostMitigation_none ) | GHOST_MITIGATE( ghostMitigation_semrau ) |                                        \
+	  GHOST_MITIGATE( ghostMitigation_topological ) )
+#define GHOST_MITIGATIONS_SEMRAU ( GHOST_MITIGATIONS_BASIC | GHOST_MITIGATE( ghostMitigation_semrau ) )
+#define GHOST_MITIGATIONS_ALL ( GHOST_MITIGATIONS_SEMRAU | GHOST_MITIGATE( ghostMitigation_semrauRecycling ) )
+#define GHOST_MAX_SWEEP 5
+#define GHOST_MAX_AUX_BODIES 4
+
+// Pre-solve based mitigations, applied to the player only.
+typedef enum GhostMitigation
+{
+	// No filtering
+	ghostMitigation_none = 0,
+
+	// Semrau shallow face-contact culling plus horizontal CCD culling against floor tiles, the
+	// same as the upstream Character/Ghost Culling sample. Contact recycling is disabled.
+	ghostMitigation_semrau,
+
+	// Same filter but with contact recycling left on (the v3.2 default)
+	ghostMitigation_semrauRecycling,
+
+	// Per-contact topological ghosts (shared/topo_ghosts.c). Contact recycling is disabled.
+	ghostMitigation_topological,
+
+	ghostMitigation_count
+} GhostMitigation;
+
+// Which parameter a scenario sweeps in the headless probe
+typedef enum GhostSweepField
+{
+	ghostSweep_speed = 0,
+	ghostSweep_gravityScale,
+	ghostSweep_knob,
+} GhostSweepField;
+
+typedef struct GhostParams
+{
+	int variant;
+	GhostMitigation mitigation;
+	float speed;
+	float gravityScale;
+	float knob;
+} GhostParams;
+
+typedef struct GhostMetrics
+{
+	int steps;
+	int snagCount;	 // steps where tangential speed dropped by more than 10% while in the measured region
+	int rejectedCount; // contacts culled by the mitigation callbacks
+	float minSpeedRatio; // min tangential speed / launch speed
+	float maxHop;		 // max height above the resting height along the surface normal
+	float maxSink;		 // max depth below the resting height
+	float maxKick;		 // max velocity along the surface normal
+	float progress;		 // distance travelled along the surface tangent
+	float idealProgress; // launch speed * elapsed time, for time loss
+	bool finished;		 // reached the end of the path
+	bool fellThrough;	 // sank below the fall threshold
+} GhostMetrics;
+
+typedef struct GhostRun
+{
+	b2WorldId worldId;
+	b2BodyId playerId;
+	b2ShapeId playerShapeId;
+	int scenarioIndex;
+	GhostParams params;
+
+	// Measurement frame
+	b2Vec2 origin;
+	b2Vec2 tangent;
+	b2Vec2 normal;
+	float restHeight;	 // player height along the normal when resting on the surface
+	float measureStart; // progress where metrics start (skip launch ramps)
+	float pathLength;	 // progress that counts as finished
+	float fallDepth;	 // sink beyond this counts as falling through
+	float lastTangentSpeed;
+
+	// Optional scenario driven bodies (kinematic platforms) and the time at the start of the
+	// current step, steps * 1/60, for deterministic motion
+	b2BodyId auxBodyIds[GHOST_MAX_AUX_BODIES];
+	b2Vec2 auxOrigins[GHOST_MAX_AUX_BODIES];
+	int auxBodyCount;
+	float auxPhase;
+	float time;
+
+	// State for ghostMitigation_topological
+	TopoGhostContext topo;
+
+	GhostMetrics metrics;
+} GhostRun;
+
+typedef struct GhostScenario
+{
+	const char* name;
+	const char* summary;
+	const char* knobName;
+	const char* variantNames[GHOST_MAX_VARIANTS];
+	int variantCount;
+
+	// Bit mask of GHOST_MITIGATE( ghostMitigation_* ) that make sense for this scenario
+	unsigned int mitigationMask;
+
+	float speed;
+	float gravityScale;
+	float knob;
+
+	GhostSweepField sweepField;
+	float sweep[GHOST_MAX_SWEEP];
+	int sweepCount;
+
+	// Hard step cap for the headless probe
+	int maxSteps;
+
+	void ( *create )( GhostRun* run );
+
+	// Optional, called before each world step (drives kinematic bodies). May be NULL.
+	void ( *step )( GhostRun* run );
+
+	// Variant the sample opens with: the one that shows the clearest difference between mitigations
+	int defaultVariant;
+
+	// Variants (bit mask) where the correct outcome is being blocked (a real wall or step): finishing
+	// the path means the player passed through real geometry
+	unsigned int blockedVariants;
+
+	// The outcome is not captured by the metrics, judge it with --trace or in the sample
+	bool judgeManually;
+} GhostScenario;
+
+extern const GhostScenario g_ghostScenarios[];
+extern const int g_ghostScenarioCount;
+
+const char* GhostMitigationName( GhostMitigation mitigation );
+
+// Default parameters for a scenario
+GhostParams GhostDefaultParams( int scenarioIndex );
+
+// Build the scenario in an empty world. Installs pre-solve callbacks that reference run, so run
+// must stay at a fixed address while the world lives.
+void GhostRun_Create( GhostRun* run, b2WorldId worldId, int scenarioIndex, GhostParams params );
+
+// Call before each world step (drives scenario bodies, refreshes the topological ghost neighborhood)
+void GhostRun_PreStep( GhostRun* run );
+
+// Call after each world step to update the metrics
+void GhostRun_Update( GhostRun* run );
+
+#ifdef __cplusplus
+}
+#endif

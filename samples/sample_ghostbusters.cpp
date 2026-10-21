@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 mache102
 // SPDX-License-Identifier: MIT
 
-// Custom (ghostbusters) ghost collision samples. Ported from the pre-v3.2 fork benchmarks.
-// These use the b2Custom* ghost vertex API declared in box2d.h.
+// Legacy ghost collision samples ported from the pre-v3.2 fork benchmarks. They use the b2Custom*
+// ghost vertex API declared in box2d.h and are listed under "Ghost Collisions" with a "Legacy -"
+// prefix. The instrumented scenarios in sample_ghost_collisions.cpp supersede most of them.
 
 #include "sample.h"
 
@@ -64,6 +65,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Superseded by Ghost Collisions / Sliding Box and Crate Floor Circle (static box tiles)" );
 		m_tick++;
 
 		b2Pos ballPos = b2Body_GetPosition( m_ballId );
@@ -115,7 +118,7 @@ public:
 	float m_liftoff_x_val; // first x-value the ball took a ghost collision and 'flew' off the ground
 };
 
-static int sampleGhostGroundBoxes = RegisterSample( "Ghostbusters", "Ground Boxes", GhostGroundBoxes::Create );
+static int sampleGhostGroundBoxes = RegisterSample( "Ghost Collisions", "Legacy - Ground Boxes", GhostGroundBoxes::Create );
 
 // Ground Boxes, but with unchained plain segment tiles. Toggle custom ghost vertices on the
 // segments (b2CustomShape_SetGhostVertices) to compare plain two-sided segment collision against
@@ -194,6 +197,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Superseded by Ghost Collisions / Sliding Box, variant 'custom ghost segments'" );
 		m_tick++;
 
 		b2Pos ballPos = b2Body_GetPosition( m_ballId );
@@ -248,7 +253,7 @@ public:
 };
 
 static int sampleGhostGroundSegments =
-	RegisterSample( "Ghostbusters", "Ground Segments", GhostGroundSegments::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Ground Segments", GhostGroundSegments::Create );
 
 class GhostPathHorizontal : public Sample
 {
@@ -273,6 +278,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Closest scenario: Ghost Collisions / Crate Floor Circle, variant 'static box tiles' (balls over box tiles)" );
 
 		float farthestX = -FLT_MAX;
 
@@ -384,7 +391,7 @@ private:
 };
 
 static int sampleGhostPathHorizontal =
-	RegisterSample( "Ghostbusters", "Ghost Path (Horizontal)", GhostPathHorizontal::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Ghost Path (Horizontal)", GhostPathHorizontal::Create );
 
 class GhostPathDiagonal : public Sample
 {
@@ -410,6 +417,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Closest scenario: Ghost Collisions / Slope Tiles (rotated tiles; this one uses balls and alternating restitution)" );
 
 		float farthestPathDistance = -FLT_MAX;
 
@@ -529,7 +538,7 @@ private:
 };
 
 static int sampleGhostPathDiagonal =
-	RegisterSample( "Ghostbusters", "Ghost Path (Diagonal)", GhostPathDiagonal::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Ghost Path (Diagonal)", GhostPathDiagonal::Create );
 
 class GhostChainSegmentRoll : public Sample
 {
@@ -604,6 +613,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Demo of b2CustomCreateChainSegmentShape + b2CustomChainSegment_SetGhostVertices" );
 
 		b2Pos pos = b2Body_GetPosition( m_ballId );
 		DrawScreenTextLine( "Ball pos: (%.2f, %.2f)", (float)pos.x, (float)pos.y );
@@ -618,7 +629,7 @@ public:
 };
 
 static int sampleGhostChainSegmentRoll =
-	RegisterSample( "Ghostbusters", "Chain Segment Roll", GhostChainSegmentRoll::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Chain Segment Roll", GhostChainSegmentRoll::Create );
 
 // Chain segment version of Ground Boxes: identical ball/force parameters, using
 // b2CustomCreateChainSegmentShape and b2CustomChainSegment_SetGhostVertices instead of ground boxes.
@@ -701,6 +712,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Superseded by Ghost Collisions / Sliding Box, variant 'chain' (loose chain segments)" );
 		m_tick++;
 
 		b2Pos ballPos = b2Body_GetPosition( m_ballId );
@@ -742,7 +755,7 @@ public:
 };
 
 static int sampleGhostChainSegmentGround =
-	RegisterSample( "Ghostbusters", "Chain Segment Ground", GhostChainSegmentGround::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Chain Segment Ground", GhostChainSegmentGround::Create );
 
 // Kinematic variant of Chain Segment Ground: ground is a kinematic body that moves upward at
 // constant velocity. Reduced FORCE (5.0) to make ball behavior easier to observe.
@@ -822,6 +835,8 @@ public:
 	void Step() override
 	{
 		Sample::Step();
+		DrawScreenTextLine( "Legacy sample ported from the pre-v3.2 fork (no metrics or mitigation switch)" );
+		DrawScreenTextLine( "Superseded by Ghost Collisions / Moving Platform and Elevator Seam" );
 		m_tick++;
 
 		// Kinematic ground moves upward at fixed velocity (no acceleration)
@@ -867,4 +882,4 @@ public:
 };
 
 static int sampleGhostKinematicChainSegment =
-	RegisterSample( "Ghostbusters", "Kinematic Chain Segment", GhostKinematicChainSegment::Create );
+	RegisterSample( "Ghost Collisions", "Legacy - Kinematic Chain Segment", GhostKinematicChainSegment::Create );

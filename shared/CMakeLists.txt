@@ -5,6 +5,10 @@ set(BOX2D_SHARED_FILES
 	benchmarks.h
 	determinism.c
 	determinism.h
+	ghost_scenarios.c
+	ghost_scenarios.h
+	topo_ghosts.c
+	topo_ghosts.h
 	human.c
 	human.h
 	utils.c
