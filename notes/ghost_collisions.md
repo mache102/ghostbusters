@@ -2,7 +2,7 @@
 
 Branch `ghostbusters`, Box2D v3.2.0+2 (`a292912`). Written 2026-10-21 as groundwork for experiments that detect ghost collisions and try to resolve them in a new way.
 
-**Follow-up:** the per-contact topological ghost idea from section 6 has been implemented and measured. See [topological_ghosts.md](topological_ghosts.md).
+**Follow-up:** the per-contact topological ghost idea from section 6 has been implemented and measured. See [topological_ghosts.md](topological_ghosts.md). The scenario set has since been curated, so some scenarios named below (Capsule, Default Ghosts, Rolling Hexagon) no longer exist as samples. The measurements here are kept as the historical record.
 
 Every claim marked **measured** comes from `experiments/ghost_probe`. The full tables are in [ghost_probe_results.md](ghost_probe_results.md), and each scenario can also be watched in the samples app under **Ghost Collisions**. Claims marked *code reading* were traced through the source but not run.
 

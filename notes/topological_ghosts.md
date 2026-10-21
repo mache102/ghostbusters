@@ -1,6 +1,6 @@
 # Topological ghosts: results for game developers
 
-Branch `ghostbusters` (Box2D v3.2.0+2). Written 2026-10-21.
+Branch `ghostbusters` (Box2D v3.2.0+2). Updated 2026-10-21.
 
 This is the experiment that follows [ghost_collisions.md](ghost_collisions.md). Raw data:
 - [ghost_defaults.md](ghost_defaults.md): every sample at its default settings.
@@ -8,141 +8,142 @@ This is the experiment that follows [ghost_collisions.md](ghost_collisions.md). 
 
 ## The short version
 
-A *ghost collision* is when a body sliding or rolling across a flat surface made of several pieces catches on the seam between them, as if there were a tiny wall. It stops dead, gets kicked into the air, or tumbles.
+A *ghost collision* is when a body sliding or rolling across a surface made of several pieces catches on a seam between them, as if there were a tiny wall or bump. It stops dead, gets kicked into the air, or tumbles.
 
-Box2D's built-in fix is the **chain shape**. It works, but only for static terrain merged into one chain. The upstream sample's fix is **Semrau's filter**: it drops short, flat contacts. It works for upright boxes, but does nothing for balls, tilted or rotating shapes, or two-sided segments, and it fails under heavy load.
+Box2D's built-in fix is the **chain shape**. It only works for static terrain merged into one chain. The upstream sample's fix is **Semrau's filter**: it drops short, flat contacts. It works for upright boxes, but does nothing for balls, tilted or rotating shapes, or two-sided segments, and it fails under heavy load.
 
-**Topological ghosts** is a new mitigation built on Box2D v3.2's pre-solve callback. For one "player" body it works out, every step, which edges of the nearby shapes form the real surface. It ignores the hidden ones and rebuilds the contact as if the surface were one smooth chain. Because it is recomputed each step at the current poses, it also works across separate bodies: moving platforms, dynamic crates, and pieces of different shapes.
+**Topological ghosts** is a new mitigation built on Box2D v3.2's pre-solve callback. For each protected body, it works out every step which edges of the nearby shapes form the real surface, ignores the hidden ones, and rebuilds the contact as if that surface were one smooth chain. It is recomputed at the current poses, so it also works across separate bodies: moving platforms, dynamic crates, pieces of different shapes, curved and sliced terrain.
 
-At default settings the samples show the following.
+## 1. What topological ghosts solves
 
-**Topological fixes cases that Semrau cannot:**
+Measured with `ghost_probe` (deterministic, 60 Hz, 4 substeps). Each row is a sample at its default settings; "ok" means it behaves like the same body on a smooth, seamless surface.
 
-| Scenario | No mitigation | Semrau | Topological |
+| Scenario (what it tests) | No mitigation | Semrau | Topological |
 |---|---|---|---|
-| Ball rolling over dynamic crates | bumpy (kick 2.3 m/s, 26% speed loss) | same as none | **smooth** |
-| Ball on a flush rotating platform | bumpy (kick 3.0 m/s) | same as none | **smooth** |
-| Free (rotating) box sliding down a slope of triangle tiles | tumbles (kick 7 m/s, 2.8 m hops) | same | **slides smoothly** |
-| Box held at a 10° tilt, sliding on its corner | bumpy (kick 1.7 m/s, 26% loss) | same | **smooth** |
-| Box on two-sided segment tiles | stuck at the first seam | stuck | **smooth** |
-| Small gaps between segment tiles | stuck | stuck | **smooth** |
-| Box sliding down a wall made of segments | stuck | hangs | **slides** |
-| 1 mm misaligned tiles | stuck | launched 1.2 m into the air | **smooth** |
-| Fast diagonal landing on tiles | launched 18 m | launched 18 m | **smooth** |
-| Two-wheel vehicle over a crest onto a tiled slope | bumpy | bumpy | **smooth** |
-| Thin plank under 2000x gravity (7 cm sink) | stuck | stuck | **finishes** (one settling spike on the first contact, as with every method) |
-| Body spawned inside the floor next to a seam | falls through the floor | falls through | **pushed out on top**, keeps going |
-| Marble over a one-way valve (marblebuilds bug) | kicked up 12 m/s | same | **fixed**, no special case needed |
-| Marble over tiles that keep interior faces (marblebuilds) | kicked up 9.7 m/s | same | **smooth** |
+| **Shape Parade**: ball, capsule, triangle, pentagon, hexagon and box sliding down a slope of triangle tiles | all 6 bumpy (kicks up to 3.6 m/s) | only pentagon and box fixed | **all 6 ok** |
+| Shape Parade on a dynamic crate floor | capsule, triangle, box stuck; others bumpy | circle and capsule still bumpy | **all 6 ok** |
+| Shape Parade on parabola crates | all worse than the smooth reference | about the same as none | **all 6 match the reference** |
+| **Parabola Hills**: ball over a 21 m bowl of static slanted slices with sine-wave hills | leaves the ground 12 times (89 steps in the air) | same | **never leaves the ground**, like the smooth chain |
+| **Parabola Crates**: ball over a curved bowl of dynamic, unevenly sliced quadrilateral crates | bumpy (kick 1.1 m/s, 31% speed loss) | same | **ok** (only crate compression remains) |
+| Ball on a flush rotating platform | bumpy (kick 3.0 m/s) | same | **ok** |
+| Free box sliding down triangle tiles | tumbles (kick 7 m/s) | same | **ok** |
+| Box held at a 10° tilt, sliding on its corner | bumpy (kick 1.7 m/s, 26% loss) | same | **ok** |
+| Ball rolling over dynamic crates | bumpy (kick 2.3 m/s) | same | **ok** |
+| Box on two-sided segment tiles / small gaps / sliding down a segment wall | stuck | stuck / hangs | **ok** |
+| 1 mm misaligned tiles | stuck | launched 1.2 m | **ok** |
+| Fast diagonal landing on tiles | launched 18 m | same | **ok** |
+| Two-wheel vehicle over a crest onto tiles | bumpy | bumpy | **ok** |
+| Thin plank under 2000x gravity (7 cm sink) | stuck | stuck | **finishes** (one settling spike on first contact, as with every method) |
+| Body spawned 15 cm inside the floor next to a seam | **falls through** | falls through | **pushed out on top**, keeps going |
+| marblebuilds: marble over a one-way valve / over tiles that keep interior faces | kicked up 12 / 9.7 m/s | same | **fixed**, no special case needed |
 
-**Both fix:** upright locked boxes on box tiles, kinematic tiles, dynamic tiles, moving, rotating and elevator platforms, and a compound (two-box) player. These are the cases Semrau was designed for.
+**Both fix** (cases Semrau was designed for): an upright box on box tiles, on moving or kinematic platforms, and as a two-box compound player.
 
-**Correctness, where blocking is the right answer:**
-- Real walls, steps, cliffs and thin walls block with every method, including topological at 80 m/s.
-- At 80 m/s, Semrau's continuous-collision filter **lets the player pass through** a thin wall. Topological stops it.
+**Correctness is kept.** Real walls and cliffs still block (walls up to 80 m/s), and real lips over about 2 cm (15 mm and 30 mm misaligned tiles) still stop a sliding box. At 80 m/s Semrau's continuous-collision filter lets a box **pass through** a thin real wall; topological stops it.
 
-**Cost:** about 1–2 µs extra per step for one player (0.002–0.004 ms vs 0.002–0.008 ms without), measured with `ghost_probe --bench`.
+**Why it generalizes.** The rules are pure geometry on edges:
+- cancel faces shared between touching pieces;
+- ignore faces lying behind the surface the body rests on;
+- pick ghost vertices from the neighbouring edges;
+- push buried bodies out through outer faces only.
+
+They don't care whether a piece is a box, a slanted quad or a segment, whether it's static, kinematic or dynamic, or whether the body is round, pointed or flat.
+
+## 2. What it does not change, because the behaviour is valid
+
+These look like problems in the numbers but are real physics, and topological correctly leaves them alone:
+
+| Case | What happens | Why it is right |
+|---|---|---|
+| Real steps and lips: a 15 mm step, a 9 mm lip on a rocking platform | a sliding box stops; a ball bumps | Geometry above the surface is real. Under about 2 cm of sink, faces *behind* the surface are ignored and faces *above* it are kept. |
+| Real gaps: 0.25 m gaps next to moving platforms | a ball dips into the gap and bumps out | the gap exists |
+| Tumbling polygons: pentagon and hexagon in Shape Parade / Hills | they hop as they tip over corners, even on a perfectly smooth chain | measured against the smooth-chain reference: equal lift-offs (4 vs 4, 7 vs 6) |
+| Rocking at polyline corners: flat faces crossing a bend in a smooth chain | small rocking kicks on the reference itself | the surface really is a polyline |
+| Dynamic crates compressing under a ball | a small push-out kick (0.2–0.4 m/s) | the crates sink 2–5 cm under load and push back |
+| Crushing: a kinematic platform driving under a wall | the player is squeezed through | Box2D behaviour, the same with every method |
+| Free flight: a ball leaving a crest faster than the surface curves away | it flies | the smooth reference does too (the hills are tuned so it doesn't) |
+
+## 3. What remains unsolved or unknown
+
+**Unsolved (measured):**
+
+| Case | What happens | Why |
+|---|---|---|
+| Hollow chains under extreme load (thin plank, ≥ 3000x gravity) | falls through the chain | Box2D drops the contact before pre-solve runs. The method can remove or replace contacts but not create them. |
+| Loose chain segments with degenerate default ghosts (ghost = endpoint) | one end cap is ignored | same reason; a fix to the default is in [ghost_collisions.md](ghost_collisions.md) §7 |
+| Extreme penetration on box tiles (≥ 3000x gravity, about 10 cm sink) | occasional pop on push-out (one run: 344 m/s kick, still finished) | the push-out manifold at large depth is crude |
+| Capsule on sliced hills | 1 airborne step (1.4 cm hop) vs 0 on the reference | marginal and not traced to a seam; it appeared with the crest fix below |
+
+**Limits of the current implementation:**
+1. **Designated bodies only.** World queries are not allowed in pre-solve, so the portable version snapshots each protected body's neighbourhood before the step. It does support several bodies at once (Shape Parade protects six).
+   - In our fork, the same rules could run inside `contact.c` for every dynamic body, using a lock-free read-only broad-phase query during collide.
+   - That would also remove the "cannot create contacts" limit.
+2. **Memory and cost.** The topology is built once per step per protected body. That is about 400 KB of state per body and 1–3 µs extra per step in these scenarios. Building once per step did not measurably speed up these small scenes (one or two contacts per step); it should pay off in dense scenes.
+3. **Unsupported terrain:** rounded polygons, circles and capsules are ignored when building the topology (they need radius-aware matching).
+4. **Custom collision rules:** filtering beyond filter bits (custom filter callback, joints, one-way platforms in your own pre-solve) must be mirrored in `filterFcn`. Otherwise those shapes still shape the topology.
+5. **Large worlds:** the neighbourhood query uses world-space float bounds, which lose precision far from the origin in double-precision builds.
+
+**Unknown (not tested yet):**
+- character movers (`b2World_CastMover`), which treat chain segments as plain segments and have no ghost handling;
+- ragdolls and joint chains;
+- dense scenes with many protected bodies (cost and memory at scale);
+- fast bodies tilted past 45° hitting a seam vertex (the code review predicts a vetoed continuous-collision hit; not measured);
+- seams between shapes on the *protected* body itself beyond the two-box compound case (e.g. a multi-shape vehicle chassis);
+- tolerance edge cases: steps right at the 5 mm and 2 cm thresholds, curves bending close to the 60° "walkable continuation" limit.
 
 ## How it works, in plain terms
 
-Every step, before Box2D's solver uses a contact between the player and some shape T:
+Before each step, the shapes near each protected body are snapshotted, and the local topology is built once:
 
-1. **Look around.** Before the step, take a snapshot of the shapes near the player: polygons, segments and chain segments, on any body type, with their current poses. Box2D does not allow world queries inside the callback, but collision runs at the start of the step, so the poses match.
-2. **Cancel interior faces.** Where two shapes touch with opposite-facing coincident faces (two tiles side by side), both faces are interior and are ignored. This is *localSeg* phase 1 from marblebuilds, but done per contact, at the current poses, across bodies.
-3. **Cancel hidden faces.** While the player rests on a surface (it is in front of it, over it, and sunk less than 2 cm), any face lying behind that surface's line cannot be touched without sinking through the surface, so it is ignored.
-   - This catches a tile's side face next to the floor the player stands on, a moving platform's side face in a small gap, and the exposed corner after a one-way valve.
-   - Real obstacles rise *above* the line, so they stay. A tall box falling past a cliff is sunk far deeper than 2 cm, so the cliff face stays live.
-4. **Pick ghost vertices.** Each remaining edge of T takes its ghost vertices from the neighbouring edges by the smallest turn (the localSeg rule). The contact is then recomputed with Box2D's own chain-segment collider, which already knows how to ignore seams on a smooth chain.
-5. **Interior relevance.** These are the rules you proposed:
-   - If the player's centre is *inside* a solid tile, it is pushed out through that tile's outer faces only, never sideways through a shared face into the next tile.
-   - If the player is *fully* buried in one tile, the next tile's shared face is kept as a wall, so the player cannot tunnel along the floor.
-   - Otherwise (on or near the surface), shared faces are cancelled.
-6. **Fast motion.** A continuous-collision hit is vetoed only when it lands on an interior (cancelled) part of T, or on a seam vertex with a normal that no real face there could produce. Hits are judged at the pose the player started the step from.
-
-The touched edge, its neighbours and the player are all just geometry, so the method covers circles, capsules and polygons at any angle, and static, kinematic or dynamic terrain.
+1. **Cancel interior faces.** Where two pieces touch with opposite-facing coincident faces (two tiles side by side, two crate slices sharing a slanted cut), both faces are interior and are ignored. This is *localSeg* phase 1 from marblebuilds, done at the current poses and across bodies.
+2. **Cancel hidden faces.** While the body rests on a surface (in front of it, over it, sunk less than 2 cm), a *steep* face lying behind that surface's line can only be reached by sinking through the surface, so it is ignored.
+   - This catches a tile's side face, a moving platform's side face in a small gap, and the exposed corner after a one-way valve.
+   - Faces within 60° of the surface's orientation are walkable continuations (a convex crest) and are kept.
+   - Real obstacles rise *above* the line, so they also stay.
+3. **Pick ghost vertices.** Each remaining edge takes its ghost vertices from the neighbouring remaining edges by the smallest turn (the localSeg rule). The contact is recomputed with Box2D's own chain-segment collider, which already knows how to ignore seams on a smooth chain.
+4. **Interior relevance.**
+   - Centre inside a solid piece: the body is pushed out through that piece's outer faces only, never sideways through a shared face.
+   - Fully buried: the neighbour's shared face is kept as a wall so the body cannot tunnel along.
+5. **Fast motion.** A continuous-collision hit is vetoed only if it lands on an interior part, or on a seam vertex with a normal no real face there could produce. Hits are judged at the pose the body started the step from.
 
 ## Using it in a game (stock Box2D v3.2)
 
 ```c
 #include "topo_ghosts.h"   // shared/topo_ghosts.{h,c}, no engine changes needed
 
-TopoGhostContext topo;     // must stay at a fixed address while the world lives
-TopoGhost_Init( &topo, worldId, playerBodyId );
-topo.config.timeStep = 1.0f / 60.0f;
-b2World_SetPreSolveCallback( worldId, TopoGhostPreSolve, TopoGhostPreContinuous, &topo );
+TopoGhostContext* topo = malloc( sizeof( TopoGhostContext ) );   // ~400 KB, keep off the stack
+TopoGhost_Init( topo, worldId, playerBodyId );
+topo->config.timeStep = 1.0f / 60.0f;
+b2World_SetPreSolveCallback( worldId, TopoGhostPreSolve, TopoGhostPreContinuous, topo );
 // every player shape: shapeDef.enablePreSolveEvents = true
 
 // game loop
-TopoGhost_PreStep( &topo );          // snapshot the neighbourhood (also turns off contact recycling on the player)
+TopoGhost_PreStep( topo );           // snapshot + build topology (also turns off contact recycling on the player)
 b2World_Step( worldId, dt, 4 );
 ```
 
-**Requirements and caveats:**
-- **Contact recycling** must be off for the player, because a recycled contact skips pre-solve. `TopoGhost_PreStep` does this.
-- **Custom collision rules:** if you filter collisions beyond filter bits (custom filter callback, joints with `collideConnected = false`, one-way platforms in your own pre-solve), set `topo.filterFcn` to mirror them. Otherwise those shapes still shape the topology.
-- **One designated body:** it works for a player body, not for every body in the world (see "What remains").
-
-## What it solves
-
-- **Seams between any pieces, on any bodies:** static tiles, kinematic and moving platforms, rocking platforms, elevators, dynamic crates, and pieces of different types (box, triangle, segment, chain segment).
-- **Shapes other than upright boxes:**
-  - balls (1-point contacts, which Semrau never sees);
-  - polygons at any angle, free to rotate, which stops tumbling at seams;
-  - capsules;
-  - compound bodies.
-- **Two-sided segments**, which neither chains nor Semrau handle.
-- **Small misalignment and small gaps** (under about 2 cm), with real steps and lips above that kept.
-- **Heavy load** (up to about 2000x gravity in the tests), where Semrau's fixed 2 cm threshold fails.
-- **Sunk or spawned-inside bodies:** pushed out, not through. Stock Box2D drops a body 15 cm into a two-tile floor straight through it.
-- **The two marblebuilds snags** (one-way valve, pass-through tiles), without per-block special cases.
-- **High-speed seams** for continuous collision, without letting real thin walls be tunnelled.
-
-## What it does not solve (measured)
-
-| Case | What happens | Why |
-|---|---|---|
-| Hollow chains under extreme load (thin plank, ≥ 3000x gravity) | falls through | Chains are one-sided and Box2D drops the contact before pre-solve runs. The method can remove or replace contacts but not create them. |
-| Degenerate loose chain segment ghosts (ghost = endpoint) | one end cap is ignored | Same reason: Box2D's collider drops the contact first. A one-line fix to the default ghosts is in [ghost_collisions.md](ghost_collisions.md) §7. |
-| Real geometry | a 15 mm step stops a sliding box; a ball dips into a 0.25 m gap; a rocking tile's 9 mm lip bumps a ball | Correct behaviour, not ghosts. Tolerances are about 5 mm for "touching" and 2 cm for "sunk". |
-| Extreme penetration (≥ 3000x gravity, about 10 cm sink, box tiles) | occasional pop on push-out (one run: 344 m/s kick, still finished) | The push-out manifold at large depth is crude (deepest points only) |
-| Being crushed by a kinematic platform | player squeezed through | Box2D behaviour, the same with every method |
-
-## What remains
-
-1. **Every body, not just one player.** World queries are not allowed in pre-solve, so the portable version snapshots one body's neighbourhood before the step.
-   - This branch is our own fork. The same rules can run inside the library, in `contact.c`'s manifold functions, for every dynamic body, using a lock-free read-only broad-phase query during the collide phase, which does not modify the trees.
-   - That would also remove the "cannot create contacts" limit (the hollow-chain and default-ghost cases above).
-2. **Build the scene once per step.** It is rebuilt per contact today. Building it in `PreStep`, in the player's frame, would cut most of the per-contact cost (O(edges²) cancellation).
-3. **Unsupported neighbours:** rounded polygons, circles and capsules as *terrain* are ignored when building the topology. They need radius-aware matching.
-4. **Fast tilted bodies** (from the code review, not measured): a fast body tilted past 45° hitting a seam vertex can have its continuous-collision hit vetoed. Push-out should recover it, but it is a known weak spot.
-5. **Large worlds:** the neighbourhood query uses world-space float bounds, which loses precision far from the origin in double-precision builds.
-6. **Not tested yet:**
-   - character movers (`b2World_CastMover`), which treat chain segments as plain segments;
-   - ragdolls and joint chains;
-   - many simultaneous players.
+For several protected bodies, use one context per body and a dispatching callback that forwards each contact to the right context. `shared/ghost_scenarios.c` (`MultiPreSolve` / `MultiPreContinuous`, which route each contact to its player) shows how.
 
 ## How it was verified
 
-- **30 scenarios plus 7 legacy samples**, each with none, Semrau and topological. 12 of them were written by an adversarial tester specifically to break the method: real walls, steps, cliffs, thin walls, ceilings, crush, fast back-face hits, crests.
-- **A code review** found three critical issues, all fixed and re-run:
-  - edge-split overflow could delete real ground;
-  - continuous-collision hits were judged at the end-of-step pose;
-  - contact recycling silently disabled the method.
-- **The adversarial tests** found three regressions, all fixed:
-  - a hole at convex crests;
-  - compound bodies using the body centre;
-  - a continuous-collision back-face tunnel.
-- **A final trace** fixed one more case: ghosts picked from faces that were themselves hidden.
-- **Unit tests** pass, the samples build, and all 37 Ghost Collisions entries were smoke-run headless under Xvfb with no crashes. That run covered "none" and "topological" with four solver workers; Semrau was exercised only in the single-threaded probe.
+- **22 scenarios**, each run with none, Semrau and topological, at default settings and full parameter sweeps. Several have multiple bodies, reported per body against a smooth-surface reference.
+  - Correctness checks: Tile Wall, Cliff Pit, CCD Back Face.
+  - The earlier set of 33 was curated down: scenarios whose comparison duplicated another, or was identical for all three mitigations, were removed (list in the curation commit).
+- **Review and testing:**
+  - a code review found three critical issues, all fixed;
+  - an adversarial tester found three regressions, all fixed;
+  - traces found three more: ghosts picked from hidden faces, and flat bodies losing support at convex crests of a smooth chain under both covering rules. All fixed and re-measured.
+- **Builds and tests:** unit tests pass, the samples build, and all Ghost Collisions samples smoke-run headless under Xvfb, including with topological on and four solver workers.
 
 ## Reproducing
 
 ```sh
-just probe --defaults          # the table above, every sample at default settings
-just probe "Slope Tiles"       # one scenario, full sweep
-./build/bin/ghost_probe --trace "Slope Tiles" 4 3 5   # per step: scenario, variant, mitigation (0 none, 1 semrau, 3 topological), sweep value
-./build/bin/ghost_probe --bench "Slope Tiles" 4 20    # cost, none vs topological
-just samples                   # category "Ghost Collisions", use the Mitigation dropdown
+just probe --defaults                                       # every sample at default settings
+just probe "Parabola Hills"                                 # one scenario, full sweep
+./build/bin/ghost_probe --players "Shape Parade" 3 3 6      # per body: scenario, variant, mitigation (0 none, 1 semrau, 3 topological), sweep value
+./build/bin/ghost_probe --trace "Parabola Hills" 0 0 3      # per step state and contact normals
+./build/bin/ghost_probe --bench "Slope Tiles" 4 20          # cost, none vs topological
+just samples                                                # category "Ghost Collisions", use the Mitigation dropdown
 ```
 
 **Source**
