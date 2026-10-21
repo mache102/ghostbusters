@@ -2,7 +2,7 @@
 
 Branch `ghostbusters` (Box2D v3.2.0+2). Updated 2026-10-21.
 
-This is the experiment that follows [ghost_collisions.md](ghost_collisions.md). Raw data:
+This is the experiment that follows [ghost_collisions.md](ghost_collisions.md). [topological_ghosts_internals.md](topological_ghosts_internals.md) is the technical companion: exact rules, and which rule does the work in each case. Raw data:
 - [ghost_defaults.md](ghost_defaults.md): every sample at its default settings.
 - [ghost_probe_results.md](ghost_probe_results.md): full parameter sweeps.
 
