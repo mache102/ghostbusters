@@ -1,11 +1,11 @@
-# Appendix: large convex radius on the protected polygon
+# Large convex radius on the protected polygon
 
 This tests a suggestion from the Discord thread: give the player polygon a large radius (5–10% of its width) so its corners cross seams smoothly.
 
 **How it was set up.**
 - The protected polygon's faces are inset by r = f × (minimum width) and r is added back as the polygon radius. The outer extent is unchanged; for a box this equals `b2MakeRoundedBox(hx - r, hy - r, r)`.
 - No callbacks. f ∈ {0.02, 0.05, 0.08, 0.10, 0.15, 0.25}.
-- Mitigation `ghostMitigation_rounded`, `ghost_probe --round` / `--roundness`, full data in [`experiments/ghost_probe/rounded_results.md`](../../experiments/ghost_probe/rounded_results.md).
+- Mitigation `ghostMitigation_rounded`, `ghost_probe --round` / `--roundness`, full data in [`experiments/ghost_probe/rounded_results.md`](../experiments/ghost_probe/rounded_results.md).
 
 ## Result: phase-dependent, and it converts snags into launches
 
