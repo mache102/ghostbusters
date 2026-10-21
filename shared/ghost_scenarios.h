@@ -35,7 +35,7 @@ extern "C"
 #define GHOST_MITIGATIONS_ALL ( GHOST_MITIGATIONS_SEMRAU | GHOST_MITIGATE( ghostMitigation_semrauRecycling ) )
 #define GHOST_MAX_SWEEP 5
 #define GHOST_MAX_AUX_BODIES 4
-#define GHOST_MAX_SURFACE_POINTS 32
+#define GHOST_MAX_SURFACE_POINTS 128
 #define GHOST_MAX_PLAYERS 8
 
 // Pre-solve based mitigations, applied to the player only.
@@ -87,7 +87,16 @@ typedef struct GhostMetrics
 	float idealProgress; // launch speed * elapsed time, for time loss
 	bool finished;		 // reached the end of the path
 	bool fellThrough;	 // sank below the fall threshold
+
+	// Scenarios with GhostScenario::measureAirborne only (single player): steps in the measured
+	// region where no contact point of the player is within GHOST_AIR_GAP of a surface, and the
+	// number of grounded -> airborne transitions (lift-offs)
+	int airborneSteps;
+	int liftOffCount;
 } GhostMetrics;
+
+// Contact point separation above which a player counts as airborne (see GhostMetrics::airborneSteps)
+#define GHOST_AIR_GAP 0.01f
 
 typedef struct GhostRun GhostRun;
 
@@ -117,6 +126,7 @@ typedef struct GhostPlayer
 	float driveForce;
 	float restHeight; // radius / inradius: center height when lying on a flat surface
 	float lastTangentSpeed;
+	bool airborne; // after the last step (measureAirborne scenarios)
 
 	// Topological mitigation state: player 0 uses the run's embedded context, others are heap allocated
 	TopoGhostContext* topo;
@@ -190,6 +200,7 @@ struct GhostRun
 	int playerCount;
 	int framePlayer; // player being measured, read by localFrame callbacks
 	int stepCount;	 // world steps since the run was created
+	bool airborne;	 // player 0 was airborne after the last step (measureAirborne scenarios)
 };
 
 typedef struct GhostScenario
@@ -234,6 +245,10 @@ typedef struct GhostScenario
 	// reference variant run without mitigation, so motion that the surface shape causes by itself
 	// (rocking across polyline vertices) is not counted as a ghost symptom.
 	int ( *referenceVariant )( int variant );
+
+	// Track airborne steps and lift-offs (GhostMetrics::airborneSteps, liftOffCount). The probe adds
+	// them as columns for this scenario and its verdict flags lift-off.
+	bool measureAirborne;
 } GhostScenario;
 
 extern const GhostScenario g_ghostScenarios[];

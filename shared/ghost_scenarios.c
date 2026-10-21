@@ -2061,6 +2061,258 @@ static void CreateShapeParade( GhostRun* run )
 	}
 }
 
+// Parabola Hills: Parabola Crates at 3x scale (the ball keeps its size) with static crates and a
+// sine wave cut into the band top, so the ball rolls over gentle hills and through valleys. The
+// band between the floor y = x^2 / 24 and HillsTop (floor + HILLS_THICKNESS + a cosine) is sliced
+// by slanted cuts of uneven spacing into convex polygons: two vertices on the floor, the rest on
+// the top curve. Each slice samples the top curve every HILLS_TOP_SPACING where the curve is
+// concave down (crests); where it is concave up (valleys) the convex hull keeps one straight top
+// edge per slice. Adjacent slices share their cut edge exactly. The ball must stay on the ground:
+// the hill curvature is chosen so the smooth reference never lifts off (see HILLS_AMPLITUDE).
+#define HILLS_SLICE_COUNT 20
+#define HILLS_X0 -10.5f
+#define HILLS_SPAN 21.0f
+#define HILLS_THICKNESS 1.2f
+
+// Lift-off on a crest needs v^2 * curvature > g * cos( slope ). Rolling down from the rim gives
+// v^2 ~ 6 g at the bottom, so the net crest curvature A k^2 - 1/12 must stay well below 1/6.
+// A k^2 = 0.177 here (net crest curvature 0.094), valleys are concave up by 0.26.
+#define HILLS_AMPLITUDE 0.22f
+#define HILLS_WAVELENGTH 7.0f
+#define HILLS_TOP_SPACING 0.25f
+#define HILLS_FRICTION 0.6f
+
+// Finished this far (arc length) before the end of the far rim
+#define HILLS_FINISH_MARGIN 3.0f
+
+// Parade variants: launched at the polyline segment at this x, finished at the second x
+#define HILLS_PARADE_START_X -7.0f
+#define HILLS_PARADE_END_X 3.0f
+
+typedef enum HillsVariant
+{
+	hills_staticSlices,
+	hills_separateBodies,
+	hills_smoothChain,
+	hills_paradeSlices,
+	hills_paradeChain,
+} HillsVariant;
+
+static float HillsFloor( float x )
+{
+	return x * x / 24.0f;
+}
+
+static float HillsTop( float x )
+{
+	return HillsFloor( x ) + HILLS_THICKNESS + HILLS_AMPLITUDE * cosf( 2.0f * B2_PI * x / HILLS_WAVELENGTH );
+}
+
+// Appends the top chain of a slice hull (the vertices that are not bottom corners) to the surface
+// polyline, left to right. The first vertex is the previous slice's last one and is skipped.
+static void AppendHullTop( GhostRun* run, const b2Hull* hull, b2Vec2 bottomLeft, b2Vec2 bottomRight, bool skipFirst )
+{
+	b2Vec2 top[B2_MAX_POLYGON_VERTICES];
+	int count = 0;
+	for ( int i = 0; i < hull->count; ++i )
+	{
+		b2Vec2 p = hull->points[i];
+		if ( b2Distance( p, bottomLeft ) > FLT_EPSILON && b2Distance( p, bottomRight ) > FLT_EPSILON )
+		{
+			top[count++] = p;
+		}
+	}
+
+	// Insertion sort by x (the top curve is a function of x)
+	for ( int i = 1; i < count; ++i )
+	{
+		b2Vec2 p = top[i];
+		int j = i - 1;
+		while ( j >= 0 && top[j].x > p.x )
+		{
+			top[j + 1] = top[j];
+			j -= 1;
+		}
+		top[j + 1] = p;
+	}
+
+	for ( int i = skipFirst ? 1 : 0; i < count; ++i )
+	{
+		B2_ASSERT( run->surfacePointCount < GHOST_MAX_SURFACE_POINTS );
+		run->surfacePoints[run->surfacePointCount++] = top[i];
+	}
+}
+
+// Every variant is judged against the smooth chain (same top polyline, no seams) with the same bodies
+static int ParabolaHillsReference( int variant )
+{
+	return variant >= hills_paradeSlices ? hills_paradeChain : hills_smoothChain;
+}
+
+// Curvature of the top curve (positive: concave up), for the parade drive load
+static float HillsCurvature( float x )
+{
+	float k = 2.0f * B2_PI / HILLS_WAVELENGTH;
+	float slope = x / 12.0f - HILLS_AMPLITUDE * k * sinf( k * x );
+	float second = 1.0f / 12.0f - HILLS_AMPLITUDE * k * k * cosf( k * x );
+	float s = sqrtf( 1.0f + slope * slope );
+	return second / ( s * s * s );
+}
+
+// Shape Parade frame (energy per player) over the hills, distinct so StepShapeParade uses HillsCurvature
+static GhostLocalFrame ParadeHillsFrame( const GhostRun* run, b2Vec2 position )
+{
+	return ParadeParabolaFrame( run, position );
+}
+
+// Builds the floor, rim walls and the sliced band (or only its top as a polyline when smooth,
+// separateBodies: one static body per slice) with the given surface friction. Sets the run's surface polyline to the band top and
+// returns its arc length.
+static float BuildParabolaHills( GhostRun* run, bool smooth, bool separateBodies, float friction )
+{
+	// Relative slice widths (0.7 to 1.5 m after scaling) and cut skews (top x - bottom x)
+	static const float widths[HILLS_SLICE_COUNT] = { 1.0f, 1.4f, 0.75f, 1.15f, 0.85f, 1.3f, 0.7f, 1.05f, 1.45f, 0.9f,
+													 1.2f, 0.8f, 1.35f, 0.95f, 1.1f, 0.72f, 1.25f, 0.88f, 1.4f, 1.0f };
+	static const float skews[HILLS_SLICE_COUNT + 1] = { 0.18f, -0.24f, 0.3f,	-0.15f, 0.27f, -0.3f, 0.12f,
+														0.36f, -0.21f, 0.24f,  -0.27f, 0.15f, -0.18f, 0.3f,
+														-0.12f, 0.21f, -0.24f, 0.09f,  -0.3f, 0.18f,  -0.12f };
+	float widthSum = 0.0f;
+	for ( int i = 0; i < HILLS_SLICE_COUNT; ++i )
+	{
+		widthSum += widths[i];
+	}
+
+	b2Vec2 bottom[HILLS_SLICE_COUNT + 1];
+	float topX[HILLS_SLICE_COUNT + 1];
+	float xb = HILLS_X0;
+	for ( int i = 0; i <= HILLS_SLICE_COUNT; ++i )
+	{
+		bottom[i] = (b2Vec2){ xb, HillsFloor( xb ) };
+		topX[i] = xb + skews[i];
+		if ( i < HILLS_SLICE_COUNT )
+		{
+			xb += widths[i] * HILLS_SPAN / widthSum;
+		}
+	}
+
+	b2BodyId groundId = CreateGround( run->worldId, b2_staticBody );
+	AddPolyline( groundId, bottom, HILLS_SLICE_COUNT + 1, friction );
+
+	// Rim walls clear of the band keep the ball in the bowl (sample only, the probe stops at the path end)
+	{
+		b2ShapeDef wallDef = b2DefaultShapeDef();
+		float y = HillsFloor( HILLS_X0 ) + 3.0f;
+		b2Polygon left = b2MakeOffsetBox( 0.3f, 3.0f, (b2Vec2){ HILLS_X0 - 0.6f, y }, b2Rot_identity );
+		b2Polygon right = b2MakeOffsetBox( 0.3f, 3.0f, (b2Vec2){ -HILLS_X0 + 0.6f, y }, b2Rot_identity );
+		b2CreatePolygonShape( groundId, &wallDef, &left );
+		b2CreatePolygonShape( groundId, &wallDef, &right );
+	}
+
+	// Slice polygons, also the source of the top polyline for every variant
+	run->surfacePointCount = 0;
+	for ( int i = 0; i < HILLS_SLICE_COUNT; ++i )
+	{
+		float x0 = topX[i];
+		float x1 = topX[i + 1];
+		int segments = (int)ceilf( ( x1 - x0 ) / HILLS_TOP_SPACING );
+		segments = b2ClampInt( segments, 1, B2_MAX_POLYGON_VERTICES - 3 );
+
+		b2Vec2 points[B2_MAX_POLYGON_VERTICES];
+		int count = 0;
+		points[count++] = bottom[i];
+		points[count++] = bottom[i + 1];
+		for ( int j = 0; j <= segments; ++j )
+		{
+			float x = x0 + ( x1 - x0 ) * j / segments;
+			points[count++] = (b2Vec2){ x, HillsTop( x ) };
+		}
+
+		// The hull drops top samples in concave up (valley) parts and keeps the cut vertices
+		b2Hull hull = b2ComputeHull( points, count );
+		B2_ASSERT( hull.count >= 4 );
+		AppendHullTop( run, &hull, bottom[i], bottom[i + 1], i > 0 );
+
+		if ( smooth )
+		{
+			continue;
+		}
+
+		b2BodyId bodyId = groundId;
+		if ( separateBodies )
+		{
+			bodyId = CreateGround( run->worldId, b2_staticBody );
+		}
+
+		b2ShapeDef shapeDef = FloorShapeDef( friction );
+		b2Polygon polygon = b2MakePolygon( &hull, 0.0f );
+		b2CreatePolygonShape( bodyId, &shapeDef, &polygon );
+	}
+
+	const b2Vec2* top = run->surfacePoints;
+	int topCount = run->surfacePointCount;
+	B2_ASSERT( top[0].x == topX[0] && top[topCount - 1].x == topX[HILLS_SLICE_COUNT] );
+	if ( smooth )
+	{
+		// Reference: the same top surface as one chain-like polyline, no seams
+		AddPolyline( groundId, top, topCount, friction );
+	}
+
+	float arcLength = 0.0f;
+	for ( int i = 1; i < topCount; ++i )
+	{
+		arcLength += b2Distance( top[i - 1], top[i] );
+	}
+	return arcLength;
+}
+
+// Variants 0-2: one rolling ball. Variants 3-4: the Shape Parade bodies (see CreateShapeParade),
+// each measured at its lowest point, launched PARADE_LAUNCH_INTERVAL steps apart.
+static void CreateParabolaHills( GhostRun* run )
+{
+	const HillsVariant variant = (HillsVariant)run->params.variant;
+	bool smooth = variant == hills_smoothChain || variant == hills_paradeChain;
+	bool parade = variant >= hills_paradeSlices;
+	float friction = parade ? PARADE_SURFACE_FRICTION : HILLS_FRICTION;
+	float arcLength = BuildParabolaHills( run, smooth, variant == hills_separateBodies, friction );
+	const b2Vec2* top = run->surfacePoints;
+
+	if ( parade )
+	{
+		// Launched from the crest at x = -7, over the valley, the center hill and into the next
+		// valley. From the rim the sliders reach ~8 m/s, tumble over the valley corners and lose too
+		// much energy at them to climb the far side, even on the smooth chain.
+		int i = 0;
+		while ( i + 2 < run->surfacePointCount && top[i + 1].x < HILLS_PARADE_START_X )
+		{
+			i += 1;
+		}
+		b2Vec2 tangent = b2Normalize( b2Sub( top[i + 1], top[i] ) );
+		b2Vec2 start = b2Lerp( top[i], top[i + 1], 0.5f );
+		AddParadePlayers( run, start, tangent );
+		GhostLocalFrame startFrame = GhostPolylineFrame( run, start );
+		b2Vec2 end = { HILLS_PARADE_END_X, HillsTop( HILLS_PARADE_END_X ) };
+		GhostLocalFrame endFrame = GhostPolylineFrame( run, end );
+		SetFlatFrame( run, 0.0f, startFrame.progress + 1.5f, endFrame.progress, 0.25f );
+		run->localFrame = ParadeHillsFrame;
+		return;
+	}
+
+	// Rolling ball launched down the local tangent of the first top segment
+	const float radius = 0.25f;
+	b2Vec2 tangent = b2Normalize( b2Sub( top[1], top[0] ) );
+	b2Vec2 start = b2MulAdd( b2Lerp( top[0], top[1], 0.5f ), radius, b2LeftPerp( tangent ) );
+	PlayerDef def = DefaultPlayerDef( run, start );
+	def.velocity = b2MulSV( run->params.speed, tangent );
+	def.angularVelocity = -run->params.speed / radius;
+	def.lockRotation = false;
+	def.friction = 0.6f;
+	CreatePlayerCircle( run, &def, radius );
+
+	SetFlatFrame( run, radius, 1.5f, arcLength - HILLS_FINISH_MARGIN, radius );
+	run->origin = start;
+	run->localFrame = ParabolaFrame;
+}
+
 // clang-format off
 const GhostScenario g_ghostScenarios[] = {
 	{
@@ -2370,6 +2622,16 @@ const GhostScenario g_ghostScenarios[] = {
 		900, CreateShapeParade, StepShapeParade,
 		3, 0, false, ShapeParadeReference,
 	},
+	{
+		"Parabola Hills",
+		"Rolling circle over static slices of a 3x Parabola Crates band whose top is a gentle cosine (hills and valleys). Correct: never leaves the ground (air = airborne steps, lifts = lift-offs)",
+		"unused",
+		{ "static slices", "static slices, separate bodies", "smooth chain", "parade, static slices", "parade, smooth chain" }, 5,
+		GHOST_MITIGATIONS_BASIC, 3.0f, 1.0f, 0.0f,
+		ghostSweep_speed, { 1.0f, 3.0f, 5.0f }, 3,
+		900, CreateParabolaHills, StepShapeParade,
+		0, 0, false, ParabolaHillsReference, true,
+	},
 };
 // clang-format on
 
@@ -2502,6 +2764,11 @@ static void StepShapeParade( GhostRun* run )
 			float vt = b2Dot( b2Body_GetLinearVelocity( player->bodyId ), f.tangent );
 			load += vt * vt * ParabolaCurvature( p.x ) / g;
 		}
+		else if ( run->localFrame == ParadeHillsFrame )
+		{
+			float vt = b2Dot( b2Body_GetLinearVelocity( player->bodyId ), f.tangent );
+			load += vt * vt * HillsCurvature( p.x ) / g;
+		}
 		load = b2MaxFloat( load, 0.0f );
 		b2Body_ApplyForceToCenter( player->bodyId, b2MulSV( player->driveForce * load, f.tangent ), true );
 	}
@@ -2605,6 +2872,25 @@ GhostLocalFrame GhostPolylineFrame( const GhostRun* run, b2Vec2 position )
 	return frame;
 }
 
+// True when no contact point of the body is within GHOST_AIR_GAP of a surface
+static bool PlayerAirborne( b2BodyId bodyId )
+{
+	b2ContactData contacts[8];
+	int contactCount = b2Body_GetContactData( bodyId, contacts, 8 );
+	for ( int i = 0; i < contactCount; ++i )
+	{
+		const b2Manifold* manifold = &contacts[i].manifold;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			if ( manifold->points[j].separation <= GHOST_AIR_GAP )
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 // Same rules as the single player update, measured at the player's support point (see GhostRun::players)
 static void UpdatePlayer( GhostRun* run, int index )
 {
@@ -2667,6 +2953,20 @@ static void UpdatePlayer( GhostRun* run, int index )
 		{
 			m->fellThrough = true;
 		}
+
+		if ( g_ghostScenarios[run->scenarioIndex].measureAirborne )
+		{
+			bool airborne = PlayerAirborne( player->bodyId );
+			if ( airborne )
+			{
+				m->airborneSteps += 1;
+				if ( player->airborne == false )
+				{
+					m->liftOffCount += 1;
+				}
+			}
+			player->airborne = airborne;
+		}
 	}
 
 	if ( s >= run->pathLength )
@@ -2700,6 +3000,8 @@ static void AggregatePlayers( GhostRun* run )
 		a.maxKick = b2MaxFloat( a.maxKick, m->maxKick );
 		a.finished = a.finished && m->finished;
 		a.fellThrough = a.fellThrough || m->fellThrough;
+		a.airborneSteps += m->airborneSteps;
+		a.liftOffCount += m->liftOffCount;
 
 		if ( player->launched && m->idealProgress > 0.0f && m->progress / m->idealProgress < worstTime )
 		{
@@ -2776,6 +3078,20 @@ void GhostRun_Update( GhostRun* run )
 		if ( -h > run->fallDepth )
 		{
 			m->fellThrough = true;
+		}
+
+		if ( g_ghostScenarios[run->scenarioIndex].measureAirborne )
+		{
+			bool airborne = PlayerAirborne( run->playerId );
+			if ( airborne )
+			{
+				m->airborneSteps += 1;
+				if ( run->airborne == false )
+				{
+					m->liftOffCount += 1;
+				}
+			}
+			run->airborne = airborne;
 		}
 	}
 

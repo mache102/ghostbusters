@@ -12,6 +12,8 @@
 
 #include <imgui.h>
 
+#include <stdio.h>
+
 template <int ScenarioIndex>
 class GhostCollisionSample : public Sample
 {
@@ -158,6 +160,10 @@ public:
 		DrawScreenTextLine( "min speed ratio %.3f, snags %d", m.minSpeedRatio > 1e30f ? 1.0f : m.minSpeedRatio, m.snagCount );
 		DrawScreenTextLine( "max hop %.4f, max sink %.4f, max kick %.3f", m.maxHop, m.maxSink, m.maxKick );
 		DrawScreenTextLine( "culled contacts %d%s", m.rejectedCount, m.fellThrough ? ", FELL THROUGH" : "" );
+		if ( scenario.measureAirborne )
+		{
+			DrawScreenTextLine( "airborne steps %d, lift-offs %d", m.airborneSteps, m.liftOffCount );
+		}
 
 		// Multi-body scenarios: the lines above show the worst player, then one line per player
 		for ( int i = 0; i < m_run.playerCount; ++i )
@@ -165,9 +171,14 @@ public:
 			const GhostPlayer& player = m_run.players[i];
 			const GhostMetrics& pm = player.metrics;
 			const char* state = player.launched == false ? "waiting" : ( pm.finished ? "finished" : "moving" );
-			DrawScreenTextLine( "%-8s %-8s kick %.2f hop %.3f minV %.2f snags %d progress %.1f%s", player.label, state,
+			char air[32] = "";
+			if ( scenario.measureAirborne )
+			{
+				snprintf( air, sizeof( air ), " lift-offs %d", pm.liftOffCount );
+			}
+			DrawScreenTextLine( "%-8s %-8s kick %.2f hop %.3f minV %.2f snags %d progress %.1f%s%s", player.label, state,
 								pm.maxKick, pm.maxHop, pm.minSpeedRatio > 1e30f ? 1.0f : pm.minSpeedRatio, pm.snagCount,
-								pm.progress, pm.fellThrough ? " FELL" : "" );
+								pm.progress, air, pm.fellThrough ? " FELL" : "" );
 		}
 	}
 
@@ -225,3 +236,4 @@ static int sampleGhost28 = RegisterGhostCollision<28>();
 static int sampleGhost29 = RegisterGhostCollision<29>();
 static int sampleGhost30 = RegisterGhostCollision<30>();
 static int sampleGhost31 = RegisterGhostCollision<31>();
+static int sampleGhost32 = RegisterGhostCollision<32>();

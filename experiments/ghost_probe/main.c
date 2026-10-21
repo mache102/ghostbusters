@@ -143,6 +143,12 @@ static const char* RelativeVerdict( const GhostMetrics* m, const GhostMetrics* r
 	{
 		return "FELL";
 	}
+	// Lift-off: any, when the reference stays grounded. Bodies that leave the ground on the reference
+	// too (polygons tumbling over polyline corners) only when clearly longer in the air.
+	if ( ref->liftOffCount == 0 ? m->liftOffCount > 0 : m->airborneSteps > ref->airborneSteps + ref->airborneSteps / 2 )
+	{
+		return "LIFTS OFF";
+	}
 	if ( m->finished == false && ref->finished )
 	{
 		return "STUCK";
@@ -183,8 +189,11 @@ static bool ReferencePlayers( int si, GhostParams params, GhostMetrics* out )
 // surface, may be NULL.
 static void PrintPlayers( const GhostScenario* scenario, int variant, const GhostRun* run, const GhostMetrics* reference )
 {
-	printf( "| player | verdict | vs reference | done | time | minV | snags | hop | sink | kick | cull | fell |\n" );
-	printf( "|---|---|---|---|---|---|---|---|---|---|---|---|\n" );
+	// Airborne columns only where the scenario measures them
+	bool air = scenario->measureAirborne;
+	printf( "| player | verdict | vs reference | done | time | minV | snags | hop | sink | kick | cull | fell |%s\n",
+			air ? " air | lifts | ref lifts |" : "" );
+	printf( "|---|---|---|---|---|---|---|---|---|---|---|---|%s\n", air ? "---|---|---|" : "" );
 	for ( int i = 0; i < run->playerCount; ++i )
 	{
 		const GhostPlayer* player = run->players + i;
@@ -200,10 +209,19 @@ static void PrintPlayers( const GhostScenario* scenario, int variant, const Ghos
 			snprintf( done, sizeof( done ), "no" );
 		}
 
-		printf( "| %s | %s | %s | %s | %.3f | %.3f | %d | %.4f | %.4f | %.3f | %d | %s |\n", player->label,
+		printf( "| %s | %s | %s | %s | %.3f | %.3f | %d | %.4f | %.4f | %.3f | %d | %s |", player->label,
 				Verdict( scenario, variant, m ), relative, done, m->idealProgress > 0.0f ? m->progress / m->idealProgress : 0.0f,
 				m->minSpeedRatio == FLT_MAX ? 0.0f : m->minSpeedRatio, m->snagCount, m->maxHop, m->maxSink, m->maxKick,
 				m->rejectedCount, m->fellThrough ? "**yes**" : "no" );
+		if ( air && reference != NULL )
+		{
+			printf( " %d | %d | %d |", m->airborneSteps, m->liftOffCount, reference[i].liftOffCount );
+		}
+		else if ( air )
+		{
+			printf( " %d | %d | - |", m->airborneSteps, m->liftOffCount );
+		}
+		printf( "\n" );
 	}
 }
 
@@ -407,6 +425,10 @@ static const char* Verdict( const GhostScenario* scenario, int variant, const Gh
 	{
 		return "FELL";
 	}
+	if ( scenario->measureAirborne && m->liftOffCount > 0 )
+	{
+		return "LIFTS OFF";
+	}
 	if ( m->finished == false )
 	{
 		return "STUCK";
@@ -420,6 +442,53 @@ static const char* Verdict( const GhostScenario* scenario, int variant, const Gh
 		return "slowed";
 	}
 	return "ok";
+}
+
+// Verdict of a measureAirborne scenario run judged against the reference variant without mitigation
+// at the same parameters (its surface polyline has real corners that cost speed): lift-offs the
+// reference does not show first, then the other symptoms. Multi-body runs: the most severe verdict
+// of any player against the same player on the reference. The absolute verdict without a
+// reference. Overwrites s_run.
+static const char* AirborneVerdict( int si, GhostParams params, const GhostMetrics* m )
+{
+	const GhostScenario* scenario = g_ghostScenarios + si;
+	int reference = scenario->referenceVariant != NULL ? scenario->referenceVariant( params.variant ) : -1;
+	if ( m->fellThrough || reference < 0 )
+	{
+		return Verdict( scenario, params.variant, m );
+	}
+
+	// Multi-body: the most severe per player verdict (each player against itself on the reference)
+	GhostMetrics players[GHOST_MAX_PLAYERS];
+	if ( ReferencePlayers( si, params, players ) )
+	{
+		const GhostRun* run = Simulate( si, params );
+		static const char* severity[] = { "FELL", "LIFTS OFF", "STUCK", "bumpy", "slowed" };
+		const char* worst = "ok";
+		int worstRank = 5;
+		for ( int i = 0; i < run->playerCount; ++i )
+		{
+			const char* verdict = RelativeVerdict( &run->players[i].metrics, players + i );
+			for ( int r = 0; r < worstRank; ++r )
+			{
+				if ( strcmp( verdict, severity[r] ) == 0 )
+				{
+					worst = verdict;
+					worstRank = r;
+					break;
+				}
+			}
+		}
+		if ( run->playerCount > 0 )
+		{
+			return worst;
+		}
+	}
+
+	params.variant = reference;
+	params.mitigation = ghostMitigation_none;
+	GhostMetrics ref = RunOnce( si, params );
+	return RelativeVerdict( m, &ref );
 }
 
 // Every scenario variant at its default parameters, none vs semrau vs topological
@@ -446,6 +515,12 @@ static int Defaults( void )
 				params.variant = vi;
 				params.mitigation = mitigations[mi];
 				GhostMetrics m = RunOnce( si, params );
+				if ( scenario->measureAirborne )
+				{
+					printf( " %s (kick %.2f, minV %.2f, lifts %d, air %d) |", AirborneVerdict( si, params, &m ), m.maxKick,
+							m.minSpeedRatio > 1e30f ? 0.0f : m.minSpeedRatio, m.liftOffCount, m.airborneSteps );
+					continue;
+				}
 				printf( " %s (kick %.2f, minV %.2f) |", Verdict( scenario, vi, &m ), m.maxKick, m.minSpeedRatio > 1e30f ? 0.0f : m.minSpeedRatio );
 			}
 			printf( "\n" );
@@ -500,9 +575,11 @@ int main( int argc, char** argv )
 		}
 
 		printf( "### %s\n\n%s\n\n", scenario->name, scenario->summary );
-		printf( "| variant | mitigation | %s | done | time | minV | snags | hop | sink | kick | cull | fell |\n",
-				SweepName( scenario ) );
-		printf( "|---|---|---|---|---|---|---|---|---|---|---|---|\n" );
+		// Airborne columns (verdict, airborne steps, lift-offs) only where the scenario measures them
+		bool air = scenario->measureAirborne;
+		printf( "| variant | mitigation | %s | done | time | minV | snags | hop | sink | kick | cull | fell |%s\n",
+				SweepName( scenario ), air ? " verdict | air | lifts |" : "" );
+		printf( "|---|---|---|---|---|---|---|---|---|---|---|---|%s\n", air ? "---|---|---|" : "" );
 
 		for ( int vi = 0; vi < scenario->variantCount; ++vi )
 		{
@@ -543,9 +620,14 @@ int main( int argc, char** argv )
 						snprintf( minV, sizeof( minV ), "%.3f", m.minSpeedRatio );
 					}
 
-					printf( "| %s | %s | %g | %s | %.3f | %s | %d | %.4f | %.4f | %.3f | %d | %s |\n", scenario->variantNames[vi],
+					printf( "| %s | %s | %g | %s | %.3f | %s | %d | %.4f | %.4f | %.3f | %d | %s |", scenario->variantNames[vi],
 							GhostMitigationName( (GhostMitigation)mi ), scenario->sweep[wi], done, timeRatio, minV,
 							m.snagCount, m.maxHop, m.maxSink, m.maxKick, m.rejectedCount, m.fellThrough ? "**yes**" : "no" );
+					if ( air )
+					{
+						printf( " %s | %d | %d |", AirborneVerdict( si, params, &m ), m.airborneSteps, m.liftOffCount );
+					}
+					printf( "\n" );
 				}
 			}
 		}
