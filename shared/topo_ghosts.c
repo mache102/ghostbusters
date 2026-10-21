@@ -568,7 +568,10 @@ static bool IsCovered( const TopoScene* scene, const int* ownerList, int ownerLi
 	for ( int i = 0; i < scene->supportCount; ++i )
 	{
 		const TopoSupport* support = scene->supports + i;
-		if ( b2Dot( ns, support->normal ) > 0.99f )
+		// Only steep faces (tile sides, undersides) are hidden by a support. A face within 60
+		// degrees of the support's orientation is a walkable continuation (a convex crest of the
+		// same surface): the player reaches it by moving along, not by sinking.
+		if ( b2Dot( ns, support->normal ) > 0.5f )
 		{
 			continue;
 		}
@@ -614,6 +617,14 @@ static bool IsCovered( const TopoScene* scene, const int* ownerList, int ownerLi
 			}
 
 			if ( InFront( c->a, c->b, centroid, linTol ) == false || Behind( c->a, c->b, far, linTol ) == false )
+			{
+				continue;
+			}
+
+			// A gentle continuation of c (within 60 degrees, a convex crest of the same surface) is
+			// reached by moving along, not hidden behind c
+			b2Vec2 nc = b2RightPerp( b2MulSV( 1.0f / length, d ) );
+			if ( b2Dot( ns, nc ) > 0.5f )
 			{
 				continue;
 			}
